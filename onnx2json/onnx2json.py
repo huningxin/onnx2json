@@ -3,6 +3,7 @@
 import sys
 import onnx
 import json
+import os
 from google.protobuf.json_format import MessageToJson
 from typing import Optional
 from argparse import ArgumentParser
@@ -38,6 +39,7 @@ def convert(
     onnx_graph: Optional[onnx.ModelProto] = None,
     output_json_path: Optional[str] = '',
     json_indent: Optional[int] = 2,
+    weights_only: Optional[bool] = False,
 ):
     """
     Parameters
@@ -60,6 +62,10 @@ def convert(
         Number of indentations in JSON.\n\
         Default: 2
 
+    weights_only: Optional[bool]
+        Save weights only.\n\
+        Default: False
+
     Returns
     -------
     onnx_json: dict
@@ -77,12 +83,25 @@ def convert(
     if not onnx_graph:
         onnx_graph = onnx.load(input_onnx_file_path)
 
-    s = MessageToJson(onnx_graph)
-    onnx_json = json.loads(s)
+    if not weights_only:
+        s = MessageToJson(onnx_graph)
+        onnx_json = json.loads(s)
 
-    if output_json_path:
-        with open(output_json_path, 'w') as f:
-            json.dump(onnx_json, f, indent=json_indent)
+        if output_json_path:
+            with open(output_json_path, 'w') as f:
+                json.dump(onnx_json, f, indent=json_indent)
+    else:
+        external_data_file_path = os.path.splitext(output_json_path)[0] + ".bin"
+        temp_external_data_onnx_file_path = "temp_external_data_model.onnx"
+        onnx.save_model(onnx_graph, temp_external_data_onnx_file_path, save_as_external_data=True, all_tensors_to_one_file=True, location=external_data_file_path, size_threshold=0, convert_attribute=False)
+        external_data_model = onnx.load(temp_external_data_onnx_file_path, load_external_data=False)
+        os.remove(temp_external_data_onnx_file_path)
+        s = MessageToJson(external_data_model)
+        onnx_json = json.loads(s)
+        initializer_josn = onnx_json['graph']['initializer']
+        if output_json_path:
+            with open(output_json_path, 'w') as f:
+                json.dump(initializer_josn, f, indent=json_indent)
 
     return onnx_json
 
@@ -110,11 +129,18 @@ def main():
         default=2,
         help='Number of indentations in JSON. (default=2)'
     )
+    parser.add_argument(
+        '-wo',
+        '--weights_only',
+        action='store_true',
+        help='Store weights only'
+    )
     args = parser.parse_args()
 
     input_onnx_file_path = args.input_onnx_file_path
     output_json_path = args.output_json_path
     json_indent = args.json_indent
+    weights_only = args.weights_only
 
     # Convert onnx model to JSON
     onnx_graph = onnx.load(input_onnx_file_path)
@@ -124,6 +150,7 @@ def main():
         onnx_graph=onnx_graph,
         output_json_path=output_json_path,
         json_indent=json_indent,
+        weights_only=weights_only
     )
 
 
