@@ -32,6 +32,7 @@ usage:
   -if INPUT_ONNX_FILE_PATH
   -oj OUTPUT_JSON_PATH
   [-i JSON_INDENT]
+  [-ew] [-js]
 
 optional arguments:
   -h, --help
@@ -45,6 +46,12 @@ optional arguments:
 
   -i JSON_INDENT, --json_indent JSON_INDENT
       Number of indentations in JSON. (default=2)
+
+  -ew, --external_weights
+      Store weights to an external file
+
+  -js, --webnn_js
+      Generate WebNN JavaScript code, must be used together with --external_weights
 ```
 
 ## 3. In-script Usage
@@ -81,6 +88,14 @@ convert(
         Number of indentations in JSON.
         Default: 2
 
+    external_weights: Optional[bool]
+        Save weights to an external file.
+        Default: False
+
+    webnn_js: Optional[bool]
+        Generate WebNN JavaScript code, must be used together with external_weights.
+        Default: False
+
     Returns
     -------
     onnx_json: dict
@@ -112,5 +127,24 @@ onnx_json = convert(
 )
 ```
 
-## 6. Issues
+## 6. Generate WebNN JavaScript model
+*Note*: Before using this tool, please ensure override the free dimensions of input ONNX model by using [onnxruntime_perf_test](https://github.com/microsoft/onnxruntime/blob/main/onnxruntime/test/perftest/README.md) tool, for example
+```bash
+$ onnxruntime_perf_test -I -r 1 -u mobilenetv2-12-static.onnx -f batch_size:1 -o 1 mobilenetv2-12.onnx
+```
+
+Then run the following command to create WebNN JavaScript model for the static ONNX model:
+```bash
+$ onnx2json -if mobilenetv2-12-static.onnx -oj mobilenet.json -ew -js
+```
+It will generate "mobilenet.bin" and "mobilenet.js" besides "mobilenet.json".
+
+An "index.html" is also generated for testing the WebNN model.
+
+Start a node.js http-server to test it in web browser with URL http://localhost:8080/.
+```bash
+$ http-server
+```
+
+## 7. Issues
 https://github.com/PINTO0309/simple-onnx-processing-tools/issues
