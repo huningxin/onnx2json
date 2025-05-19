@@ -515,8 +515,7 @@ def convert(
         # Remove existing webnn js file before saving
         if os.path.exists(webnn_js_file_path):
             os.remove(webnn_js_file_path)
-        js_path = os.path.join(os.path.dirname(output_json_path), webnn_js_file_path)
-        with open(js_path, "w", encoding="utf-8") as f:
+        with open(webnn_js_file_path, "w", encoding="utf-8") as f:
             f.write('\n\n'.join(js_lines))
 
         # Generate index.html to test the model

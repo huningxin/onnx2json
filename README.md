@@ -133,15 +133,20 @@ onnx_json = convert(
 $ onnxruntime_perf_test -I -r 1 -u mobilenetv2-12-static.onnx -f batch_size:1 -o 1 mobilenetv2-12.onnx
 ```
 
+Make a folder "mobilenet" that will contain the generated files:
+```bash
+$ mkdir mobilenet
+```
+
 Then run the following command to create WebNN JavaScript model for the static ONNX model:
 ```bash
-$ onnx2json -if mobilenetv2-12-static.onnx -oj mobilenet.json -ew -js
+$ onnx2json -if ../sample_models/mobilenetv2-12-static.onnx -oj mobilenet/mobilenet.json -ew -js
 ```
-It will generate "mobilenet.bin" and "mobilenet.js" besides "mobilenet.json".
+It will generate "mobilenet.bin" and "mobilenet.js" besides "mobilenet.json" in "mobilenet" folder.
 
 An "index.html" is also generated for testing the WebNN model.
 
-Start a node.js http-server to test it in web browser with URL http://localhost:8080/.
+Start a node.js http-server in the folder containing generated model files and launch a web browser with URL http://localhost:8080/.
 ```bash
 $ http-server
 ```

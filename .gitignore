@@ -1,5 +1,6 @@
 .vscode/
 saved_model/
+webnn_model/
 build/
 dist/
 onnx2json.egg-info/
