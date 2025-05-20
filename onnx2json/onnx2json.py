@@ -7,6 +7,8 @@ import os
 from google.protobuf.json_format import MessageToJson
 from typing import Optional
 from argparse import ArgumentParser
+import base64
+import numpy as np
 
 class Color:
     BLACK          = '\033[30m'
@@ -236,18 +238,44 @@ def convert(
             webnn_dtype = webnn_type_map.get(data_type, 'float32')
             typed_array = typed_array_map.get(data_type, 'Float32Array')
             dims_str = ', '.join(str(d) for d in dims)
+            js_var_name = to_js_var_name(name)
             if isExternalData:
-                js_var_name = to_js_var_name(name)
+                # Create a constant operand from weights_array_buffer
                 js_code = f"""const {js_var_name} = builder.constant(
         {{dataType: '{webnn_dtype}', shape: [{dims_str}]}},
         new {typed_array}(weights_array_buffer, {offset}, {length} / {typed_array}.BYTES_PER_ELEMENT)
     );"""
-            elif dims == ['1'] and data_type == 1 and "floatData" in initializer:
-                js_var_name = to_js_var_name(name)
-                value = initializer["floatData"][0]
-                js_code = f"""const {js_var_name} = {value};"""
             else:
-                js_code = f"""// Non-external initializer '{name}' is not handled."""
+                # Create a constant operand from values
+                if data_type == 7:
+                    py_data = initializer.get("int64Data", [])
+                elif data_type == 1:
+                    py_data = initializer.get("floatData", [])
+                elif data_type == 2:
+                    py_data = initializer.get("int32Data", [])
+                elif data_type == 3:
+                    py_data = initializer.get("int8Data", [])
+                elif data_type == 4:
+                    py_data = initializer.get("uint16Data", [])
+                elif data_type == 5:
+                    py_data = initializer.get("int16Data", [])
+                elif data_type == 6:
+                    py_data = initializer.get("int32Data", [])
+                elif data_type == 9:
+                    py_data = initializer.get("int32Data", [])
+                elif data_type == 11:
+                    py_data = initializer.get("doubleData", [])
+                elif data_type == 12:
+                    py_data = initializer.get("uint32Data", [])
+                elif data_type == 13:
+                    py_data = initializer.get("uint64Data", [])
+                else:
+                    py_data = []
+                js_data = "[" + ", ".join(str(x) for x in py_data) + "]"
+                js_code = f"""const {js_var_name} = builder.constant(
+        {{dataType: '{webnn_dtype}', shape: [{dims_str}]}},
+        new {typed_array}({js_data})
+    );"""
             js_lines.append("    " + js_code)
 
         # Generate all the operators
@@ -262,6 +290,73 @@ def convert(
             attr_dict = {a["name"]: a for a in attrs}
             input_vars = [to_js_var_name(i) for i in inputs]
             output_var = to_js_var_name(outputs[0])
+
+            # Handle strides
+            strides = attr_dict.get("strides", {}).get("ints", None)
+            if strides is not None:
+                assert len(strides) == 2, f"strides length must be 2, got {len(strides)}"
+                strides_js = f"[{', '.join(str(s) for s in strides)}]"
+            else:
+                strides_js = "undefined"
+
+            # Handle pads
+            # Assert only support ONNX auto_pad is NOSET if present
+            auto_pad = attr_dict.get("auto_pad", {}).get("s", None)
+            if auto_pad is not None:
+                # Decode base64 if needed
+                try:
+                    auto_pad_str = base64.b64decode(auto_pad).decode("utf-8")
+                except Exception:
+                    auto_pad_str = auto_pad
+                assert auto_pad_str == "NOTSET", f"Only auto_pad=NOTSET is supported, got {auto_pad_str}"
+
+            pads = attr_dict.get("pads", {}).get("ints", None)
+            if pads is not None:
+                assert len(pads) == 4, f"pads length must be 4, got {len(pads)}"
+                pads_webnn = [pads[0], pads[2], pads[1], pads[3]]
+                pads_js = f"[{', '.join(str(p) for p in pads_webnn)}]"
+            else:
+                pads_js = "undefined"
+
+            # Handle dilations
+            dilations = attr_dict.get("dilations", {}).get("ints", None)
+            if dilations is not None:
+                assert len(dilations) == 2, f"dilations length must be 2, got {len(dilations)}"
+                dilations_js = f"[{', '.join(str(d) for d in dilations)}]"
+            else:
+                dilations_js = "undefined"
+            groups = attr_dict.get("group", {}).get("i", None)
+            js = f"""const {output_var} = builder.conv2d(
+        {input_vars[0]}, {input_vars[1]},
+        {{
+            bias: {input_vars[2] if len(input_vars) > 2 else 'undefined'},
+            strides: {strides_js},
+            padding: {pads_js},
+            dilations: {dilations_js},
+            groups: {groups if groups is not None else 'undefined'}
+        }}
+    );"""
+            return js
+
+        # Handler for ConvTranspose -> WebNN convTranspose2d
+        def handle_convtranspose(node):
+            inputs = node.get("input", [])
+            outputs = node.get("output", [])
+            attrs = node.get("attribute", [])
+            attr_dict = {a["name"]: a for a in attrs}
+            input_vars = [to_js_var_name(i) for i in inputs]
+            output_var = to_js_var_name(outputs[0])
+
+            # Assert only support ONNX auto_pad is NOTSET if present
+            auto_pad = attr_dict.get("auto_pad", {}).get("s", None)
+            if auto_pad is not None:
+                # Decode base64 if needed
+                try:
+                    auto_pad_str = base64.b64decode(auto_pad).decode("utf-8")
+                except Exception:
+                    auto_pad_str = auto_pad
+                assert auto_pad_str == "NOTSET", f"Only auto_pad=NOTSET is supported, got {auto_pad_str}"
+
             # Handle strides
             strides = attr_dict.get("strides", {}).get("ints", None)
             if strides is not None:
@@ -285,17 +380,139 @@ def convert(
             else:
                 dilations_js = "undefined"
             groups = attr_dict.get("group", {}).get("i", None)
-            js = f"""const {output_var} = builder.conv2d(
+            # Handle output_shape (optional) -> outputSizes in WebNN
+            output_shape = attr_dict.get("output_shape", {}).get("ints", None)
+            output_sizes_js = f"[{', '.join(str(s) for s in output_shape)}]" if output_shape is not None else "undefined"
+
+            js = f"""const {output_var} = builder.convTranspose2d(
         {input_vars[0]}, {input_vars[1]},
         {{
             bias: {input_vars[2] if len(input_vars) > 2 else 'undefined'},
             strides: {strides_js},
             padding: {pads_js},
             dilations: {dilations_js},
-            groups: {groups if groups is not None else 'undefined'}
+            groups: {groups if groups is not None else 'undefined'},
+            outputSizes: {output_sizes_js}
         }}
     );"""
             return js
+
+        # Helper to extract array from initializer (externalData or embedded)
+        def get_initializer_array(name, expected_dtype, expected_len=None):
+            init = next((init for init in initializers if init['name'] == name), None)
+            assert init is not None, f"Resize input '{name}' must be an initializer"
+            # External data
+            if "externalData" in init:
+                data_type = init.get("dataType", 1)
+                assert data_type == expected_dtype, f"Resize input '{name}' must be dataType={expected_dtype}, got {data_type}"
+                offset = None
+                length = None
+                for entry in init["externalData"]:
+                    if entry["key"] == "offset":
+                        offset = int(entry["value"])
+                    elif entry["key"] == "length":
+                        length = int(entry["value"])
+                assert offset is not None and length is not None, f"Resize input '{name}' missing offset/length"
+                with open(external_data_file_path, "rb") as f:
+                    f.seek(offset)
+                    if data_type == 7:
+                        arr = np.frombuffer(f.read(length), dtype=np.int64)
+                    elif data_type == 1:
+                        arr = np.frombuffer(f.read(length), dtype=np.float32)
+                    elif data_type == 2:
+                        arr = np.frombuffer(f.read(length), dtype=np.int32)
+                    elif data_type == 3:
+                        arr = np.frombuffer(f.read(length), dtype=np.int8)
+                    elif data_type == 4:
+                        arr = np.frombuffer(f.read(length), dtype=np.uint16)
+                    elif data_type == 5:
+                        arr = np.frombuffer(f.read(length), dtype=np.int16)
+                    elif data_type == 6:
+                        arr = np.frombuffer(f.read(length), dtype=np.int32)
+                    elif data_type == 9:
+                        arr = np.frombuffer(f.read(length), dtype=np.int32)
+                    elif data_type == 11:
+                        arr = np.frombuffer(f.read(length), dtype=np.float64)
+                    elif data_type == 12:
+                        arr = np.frombuffer(f.read(length), dtype=np.uint32)
+                    elif data_type == 13:
+                        arr = np.frombuffer(f.read(length), dtype=np.uint64)
+                    else:
+                        arr = np.frombuffer(f.read(length), dtype=np.float32)
+                    py = arr.tolist()
+            else:
+                # Embedded data
+                data_type = init.get("dataType", 1)
+                if data_type == 7:
+                    py = init.get("int64Data", [])
+                elif data_type == 1:
+                    py = init.get("floatData", [])
+                elif data_type == 2:
+                    py = init.get("int32Data", [])
+                elif data_type == 3:
+                    py = init.get("int8Data", [])
+                elif data_type == 4:
+                    py = init.get("uint16Data", [])
+                elif data_type == 5:
+                    py = init.get("int16Data", [])
+                elif data_type == 6:
+                    py = init.get("int32Data", [])
+                elif data_type == 9:
+                    py = init.get("int32Data", [])
+                elif data_type == 11:
+                    py = init.get("doubleData", [])
+                elif data_type == 12:
+                    py = init.get("uint32Data", [])
+                elif data_type == 13:
+                    py = init.get("uint64Data", [])
+                else:
+                    py = []
+            if expected_len is not None:
+                assert len(py) == expected_len, f"Resize only supports {name} of length {expected_len}, got {len(py)}"
+            return py
+        
+        # Helper to extract array from Constant node in the graph
+        def get_constant_values(name, expected_dtype, expected_len=None):
+            assert expected_dtype is not None, "expected_dtype must be specified"
+            for n in onnx_json['graph'].get('node', []):
+                if n.get('opType') == 'Constant' and name in n.get('output', []):
+                    attrs = n.get('attribute', [])
+                    for attr in attrs:
+                        if attr.get("name") == "value" and "t" in attr:
+                            value_attr = attr["t"]
+                            arr = []
+                            data_type = value_attr.get("dataType", None)
+                            assert data_type == expected_dtype, f"Constant node '{name}' must have dataType={expected_dtype}, got {data_type}"
+                            # Extract array based on data_type
+                            if data_type == 7:
+                                arr = value_attr.get("int64Data", [])
+                            elif data_type == 1:
+                                arr = value_attr.get("floatData", [])
+                            elif data_type == 2:
+                                arr = value_attr.get("int32Data", [])
+                            elif data_type == 3:
+                                arr = value_attr.get("int8Data", [])
+                            elif data_type == 4:
+                                arr = value_attr.get("uint16Data", [])
+                            elif data_type == 5:
+                                arr = value_attr.get("int16Data", [])
+                            elif data_type == 6:
+                                arr = value_attr.get("int32Data", [])
+                            elif data_type == 9:
+                                arr = value_attr.get("int32Data", [])
+                            elif data_type == 11:
+                                arr = value_attr.get("doubleData", [])
+                            elif data_type == 12:
+                                arr = value_attr.get("uint32Data", [])
+                            elif data_type == 13:
+                                arr = value_attr.get("uint64Data", [])
+                            else:
+                                arr = []
+                            if expected_len is not None:
+                                assert len(arr) == expected_len, f"Constant node '{name}' must have length {expected_len}, got {len(arr)}"
+                            return arr
+                    break
+            return None
 
         # Handler for Clip -> WebNN clamp
         def handle_clip(node):
@@ -307,8 +524,28 @@ def convert(
             # ONNX Clip: input, min, max
             # WebNN clamp: builder.clamp(x, options)
             # options: {minValue, maxValue}
-            min_value = input_vars[1] if len(input_vars) > 1 else 'undefined'
-            max_value = input_vars[2] if len(input_vars) > 2 else 'undefined'
+            min_value = 'undefined'
+            max_value = 'undefined'
+
+            if len(inputs) > 1 and inputs[1]:
+                min_name = inputs[1]
+                if min_name in {init['name'] for init in initializers}:
+                    min_py = get_initializer_array(min_name, expected_dtype=1, expected_len=1)
+                    min_value = float(min_py[0])
+                else:
+                    min_py = get_constant_values(min_name, expected_dtype=1, expected_len=1)
+                    assert min_py is not None, f"Clip min input '{min_name}' must be an initializer or Constant node"
+                    min_value = float(min_py[0])
+
+            if len(inputs) > 2 and inputs[2]:
+                max_name = inputs[2]
+                if max_name in {init['name'] for init in initializers}:
+                    max_py = get_initializer_array(max_name, expected_dtype=1, expected_len=1)
+                    max_value = float(max_py[0])
+                else:
+                    max_py = get_constant_values(max_name, expected_dtype=1, expected_len=1)
+                    assert max_py is not None, f"Clip max input '{max_name}' must be an initializer or Constant node"
+                    max_value = float(max_py[0])
 
             js = f"""const {output_var} = builder.clamp(
         {input_vars[0]},
@@ -317,15 +554,6 @@ def convert(
             maxValue: {max_value}
         }}
     );"""
-            return js
-
-        # Handler for Add -> WebNN add
-        def handle_add(node):
-            inputs = node.get("input", [])
-            outputs = node.get("output", [])
-            input_vars = [to_js_var_name(i) for i in inputs]
-            output_var = to_js_var_name(outputs[0])
-            js = f"""const {output_var} = builder.add({input_vars[0]}, {input_vars[1]});"""
             return js
 
         # Handler for GlobalAveragePool -> WebNN averagePool2d
@@ -350,25 +578,14 @@ def convert(
             shape_name = inputs[1]
             assert shape_name in {init['name'] for init in initializers}, f"Reshape shape input '{shape_name}' must be an initializer"
 
-            # Generate code to read shape from weights_array_buffer
-            # Find the initializer entry
-            shape_init = next(init for init in initializers if init['name'] == shape_name)
-            assert "externalData" in shape_init, f"Reshape shape initializer '{shape_name}' must have externalData"
-            shape_offset = None
-            shape_length = None
-            for entry in shape_init["externalData"]:
-                if entry["key"] == "offset":
-                    shape_offset = int(entry["value"])
-                elif entry["key"] == "length":
-                    shape_length = int(entry["value"])
-            assert shape_offset is not None, f"Reshape shape initializer '{shape_name}' missing offset"
-            assert shape_length is not None, f"Reshape shape initializer '{shape_name}' missing length"
-            # Only support Int64Array for shape tensor
-            js_shape_array = f"new BigInt64Array(weights_array_buffer, {shape_offset}, {shape_length} / BigInt64Array.BYTES_PER_ELEMENT)"
-            # Convert BigInt64Array to Number array for WebNN and handle -1
+            # Use get_initializer_array to get shape array as Python list
+            shape_py = get_initializer_array(shape_name, expected_dtype=7)
+            # Convert shape array to JS array string
+            js_shape_array = "[" + ", ".join(str(int(x)) for x in shape_py) + "]"
+            # Handle -1 for dynamic shape
             js_shape = (
                 f"""(() => {{
-        const shape = Array.from({js_shape_array}, Number);
+        const shape = {js_shape_array};
         // Calculate the concrete size for value -1.
         if (shape.includes(-1)) {{
             const count = shape.filter(v => v === -1).length;
@@ -387,6 +604,55 @@ def convert(
             js = f"""const {output_var} = builder.reshape(
         {input_vars[0]},
         {js_shape}
+    );"""
+            return js
+
+        # Handler for Resize -> WebNN resample2d
+        def handle_resize(node):
+            inputs = node.get("input", [])
+            outputs = node.get("output", [])
+            attrs = node.get("attribute", [])
+            input_var = to_js_var_name(inputs[0])
+            output_var = to_js_var_name(outputs[0])
+
+            # Default mode is 'nearest'
+            mode = "nearest"
+            for attr in attrs:
+                if attr.get("name") == "mode" and "s" in attr:
+                    try:
+                        mode_str = base64.b64decode(attr["s"]).decode("utf-8")
+                    except Exception:
+                        mode_str = attr["s"]
+                    mode = mode_str.lower()
+
+            # Map ONNX mode to WebNN mode
+            if mode == "nearest":
+                webnn_mode = "nearest-neighbor"
+            elif mode == "linear":
+                webnn_mode = "linear"
+            elif mode == "cubic":
+                raise AssertionError("WebNN does not support cubic mode for Resize.")
+            else:
+                webnn_mode = mode  # fallback, but should not happen
+
+            scales_js = "undefined"
+            sizes_js = "undefined"
+            if len(inputs) > 3 and inputs[3]:
+                sizes_name = inputs[3]
+                sizes_py = get_initializer_array(sizes_name, expected_dtype=7, expected_len=4)
+                sizes_js = f"[{int(sizes_py[2])}, {int(sizes_py[3])}]"
+            if len(inputs) > 2 and inputs[2]:
+                scales_name = inputs[2]
+                scales_py = get_initializer_array(scales_name, expected_dtype=1, expected_len=4)
+                scales_js = f"[{float(scales_py[2])}, {float(scales_py[3])}]"
+
+            js = f"""const {output_var} = builder.resample2d(
+        {input_var},
+        {{
+            mode: '{webnn_mode}',
+            scales: {scales_js},
+            sizes: {sizes_js}
+        }}
     );"""
             return js
 
@@ -425,13 +691,145 @@ def convert(
     );"""
             return js
 
+        # Handler for Constant -> WebNN constant
+        def handle_constant(node):
+            outputs = node.get("output", [])
+            output_var = to_js_var_name(outputs[0])
+            attrs = node.get("attribute", [])
+            value_attr = None
+            for attr in attrs:
+                if attr.get("name") == "value" and "t" in attr:
+                    value_attr = attr["t"]
+                    break
+            if not value_attr:
+                return f"// Constant node {outputs[0]} missing value tensor."
+
+            data_type = value_attr.get("dataType", 1)
+            webnn_dtype = webnn_type_map.get(data_type, "float32")
+            dims = value_attr.get("dims", [])
+            shape = [int(d) for d in dims] if dims else []
+
+            # Get data and JS typed array
+            if "floatData" in value_attr:
+                data = value_attr["floatData"]
+                js_data = "[" + ", ".join(str(x) for x in data) + "]"
+                typed_array = "Float32Array"
+            elif "int32Data" in value_attr:
+                data = value_attr["int32Data"]
+                js_data = "[" + ", ".join(str(x) for x in data) + "]"
+                typed_array = "Int32Array"
+            elif "int64Data" in value_attr:
+                data = value_attr["int64Data"]
+                js_data = "[" + ", ".join(str(x) for x in data) + "]"
+                typed_array = "BigInt64Array"
+            elif "int8Data" in value_attr:
+                data = value_attr["int8Data"]
+                js_data = "[" + ", ".join(str(x) for x in data) + "]"
+                typed_array = "Int8Array"
+            elif "uint8Data" in value_attr:
+                data = value_attr["uint8Data"]
+                js_data = "[" + ", ".join(str(x) for x in data) + "]"
+                typed_array = "Uint8Array"
+            else:
+                # fallback: fill with zeros
+                size = 1
+                for d in shape:
+                    size *= d
+                data = [0] * size
+                js_data = "[" + ", ".join("0" for _ in range(size)) + "]"
+                typed_array = "Float32Array"
+
+            js = (f"""const {output_var} = builder.constant(
+        {{dataType: '{webnn_dtype}', shape: {shape}}},
+        new {typed_array}({js_data})
+    );"""
+                )
+            return js
+
+        # Handler for Transpose -> WebNN transpose
+        def handle_transpose(node):
+            inputs = node.get("input", [])
+            outputs = node.get("output", [])
+            attrs = node.get("attribute", [])
+            input_var = to_js_var_name(inputs[0])
+            output_var = to_js_var_name(outputs[0])
+            # Default perm is reversed order if not specified
+            perm = None
+            for attr in attrs:
+                if attr.get("name") == "perm" and "ints" in attr:
+                    perm = attr["ints"]
+                    break
+            if perm is not None:
+                js = f"""const {output_var} = builder.transpose(
+        {input_var},
+        {{ permutation: [{', '.join(str(p) for p in perm)}] }}
+    );"""
+            else:
+                js = f"""const {output_var} = builder.transpose(
+        {input_var}
+    );"""
+            return js
+
+        # Handler for binary ops
+        def make_binary_handler(op):
+            def handler(node):
+                inputs = node.get("input", [])
+                outputs = node.get("output", [])
+                input_vars = [to_js_var_name(i) for i in inputs]
+                output_var = to_js_var_name(outputs[0])
+                js = f"""const {output_var} = builder.{op}({input_vars[0]}, {input_vars[1]});"""
+                return js
+            return handler
+
+        # Handler for unary ops
+        def make_unary_handler(op):
+            def handler(node):
+                inputs = node.get("input", [])
+                outputs = node.get("output", [])
+                input_var = to_js_var_name(inputs[0])
+                output_var = to_js_var_name(outputs[0])
+                js = f"""const {output_var} = builder.{op}({input_var});"""
+                return js
+            return handler
+
+        # Handler for Softmax -> WebNN softmax
+        def handle_softmax(node):
+            inputs = node.get("input", [])
+            outputs = node.get("output", [])
+            attrs = node.get("attribute", [])
+            input_var = to_js_var_name(inputs[0])
+            output_var = to_js_var_name(outputs[0])
+
+            # Default axis is 1 for ONNX Softmax
+            axis = 1
+            for attr in attrs:
+                if attr.get("name") == "axis":
+                    axis = int(attr.get("i", 1))
+                    break
+
+            js = f"""const {output_var} = builder.softmax(
+        {input_var},
+        {axis}
+    );"""
+            return js
+
         # Register handlers
-        op_handlers["Conv"] = handle_conv
+        op_handlers["Add"] = make_binary_handler("add")
         op_handlers["Clip"] = handle_clip
-        op_handlers["Add"] = handle_add
-        op_handlers["GlobalAveragePool"] = handle_globalaveragepool
-        op_handlers["Reshape"] = handle_reshape
+        op_handlers["Constant"] = handle_constant
+        op_handlers["Conv"] = handle_conv
+        op_handlers["ConvTranspose"] = handle_convtranspose
+        op_handlers["Div"] = make_binary_handler("div")
         op_handlers["Gemm"] = handle_gemm
+        op_handlers["GlobalAveragePool"] = handle_globalaveragepool
+        op_handlers["Mul"] = make_binary_handler("mul")
+        op_handlers["Relu"] = make_unary_handler("relu")
+        op_handlers["Reshape"] = handle_reshape
+        op_handlers["Resize"] = handle_resize
+        op_handlers["Sigmoid"] = make_unary_handler("sigmoid")
+        op_handlers["Softmax"] = handle_softmax
+        op_handlers["Sub"] = make_binary_handler("sub")
+        op_handlers["Transpose"] = handle_transpose
         # Add more handlers as needed...
 
         # Generate operator JS code
