@@ -74,6 +74,10 @@ def convert(
         Generate WebNN JavaScript code, must be used together with external_weights.\n\
         Default: False
 
+    nhwc: Optional[bool]
+        Generate WebNN operators taking nhwc input layout, including conv2d, convTranspose2d, resample2d and pool2d.\n\
+        Default: false
+
     Returns
     -------
     onnx_json: dict
@@ -91,7 +95,14 @@ def convert(
     if not external_weights and webnn_js:
         print(
             f'{Color.RED}ERROR:{Color.RESET} '+
-            f'Saving to external weights file must be used together with generating WebNN JavaScript.'
+            f'Generating WebNN JavaScript depends on saving to external weights file (--external_weights).'
+        )
+        sys.exit(1)
+
+    if not webnn_js and nhwc:
+        print(
+            f'{Color.RED}ERROR:{Color.RESET} '+
+            f'Nchw must be used together with generating WebNN JavaScript (--webnn_js).'
         )
         sys.exit(1)
 
@@ -200,33 +211,6 @@ def convert(
             13: 'BigUint64Array',   # UINT64 (not directly supported in JS)
         }
 
-        # Generate all the graph input operands and tensors
-        js_lines.append("    // Create graph input operands and tensors.")
-        graph_inputs = onnx_json['graph'].get('input', [])
-        for input_info in graph_inputs:
-            name = input_info['name']
-            dims = input_info.get('type', {}).get('tensorType', {}).get('shape', {}).get('dim', [])
-            dims_str = ', '.join(str(d.get('dimValue', 1)) for d in dims)
-            elem_type = input_info.get('type', {}).get('tensorType', {}).get('elemType', 1)
-            webnn_dtype = webnn_type_map.get(elem_type, 'float32')
-            js_var_name = to_js_var_name(name)
-            if nhwc and len(dims) == 4:
-                # Transpose input from NCHW -> NHWC
-                # Compose builder.input and builder.transpose in one line, keeping js_var_name unchanged
-                js_code = f"""const {js_var_name} = builder.transpose(
-        builder.input('{name}', {{dataType: '{webnn_dtype}', shape: [{dims_str}]}}),
-        {{ permutation: [0, 2, 3, 1] }}
-    );"""
-            else:
-                js_code = f"""const {js_var_name} = builder.input(
-        '{name}',
-        {{dataType: '{webnn_dtype}', shape: [{dims_str}]}}
-    );"""
-            js_lines.append("    " + js_code)
-            js_lines.append(f"""    this.inputTensors_['{name}'] = await this.context_.createTensor(
-        {{dataType: '{webnn_dtype}', shape: [{dims_str}], writable: true}}
-    );""")
-
         # Generate all the constant operands
         js_lines.append("    // Create graph constant operands.")
         initializers = onnx_json['graph'].get('initializer', [])
@@ -289,6 +273,34 @@ def convert(
     );"""
             js_lines.append("    " + js_code)
 
+        # Generate all the graph input operands and tensors
+        js_lines.append("    // Create graph input operands and tensors.")
+        graph_inputs = onnx_json['graph'].get('input', [])
+        for input_info in graph_inputs:
+            name = input_info['name']
+            dims = input_info.get('type', {}).get('tensorType', {}).get('shape', {}).get('dim', [])
+            dims_str = ', '.join(str(d.get('dimValue', 1)) for d in dims)
+            elem_type = input_info.get('type', {}).get('tensorType', {}).get('elemType', 1)
+            webnn_dtype = webnn_type_map.get(elem_type, 'float32')
+            js_var_name = to_js_var_name(name)
+            if nhwc and len(dims) == 4:
+                js_lines.append("    // Transpose input from NCHW -> NHWC.")
+                # Transpose input from NCHW -> NHWC
+                # Compose builder.input and builder.transpose in one line, keeping js_var_name unchanged
+                js_code = f"""const {js_var_name} = builder.transpose(
+        builder.input('{name}', {{dataType: '{webnn_dtype}', shape: [{dims_str}]}}),
+        {{ permutation: [0, 2, 3, 1] }}
+    );"""
+            else:
+                js_code = f"""const {js_var_name} = builder.input(
+        '{name}',
+        {{dataType: '{webnn_dtype}', shape: [{dims_str}]}}
+    );"""
+            js_lines.append("    " + js_code)
+            js_lines.append(f"""    this.inputTensors_['{name}'] = await this.context_.createTensor(
+        {{dataType: '{webnn_dtype}', shape: [{dims_str}], writable: true}}
+    );""")
+
         # Generate all the operators
         op_handlers = {}
 
@@ -341,7 +353,8 @@ def convert(
             typed_array = typed_array_map.get(data_type, 'Float32Array')
             dims_str = ', '.join(str(d) for d in permuted_shape)
             filter_var_name = to_js_var_name(filter_name)+'_transposed'
-            js_lines.append(f"""const {filter_var_name} = builder.constant(
+            js_lines.append("    // Re-create constant operand from transposed weights.")
+            js_lines.append(f"""    const {filter_var_name} = builder.constant(
         {{dataType: '{webnn_dtype}', shape: [{dims_str}]}},
         new {typed_array}(weights_array_buffer, {offset}, {length} / {typed_array}.BYTES_PER_ELEMENT)
     );""")
@@ -485,15 +498,31 @@ def convert(
             output_shape = attr_dict.get("output_shape", {}).get("ints", None)
             output_sizes_js = f"[{', '.join(str(s) for s in output_shape)}]" if output_shape is not None else "undefined"
 
+            # NHWC filter transpose: IOHW -> OHWI
+            filter_name = inputs[1]
+            filter_var_name = input_vars[1]
+            filter_layout = None
+            if nhwc:
+                filter_var_name = transpose_external_weights(filter_name, (1, 2, 3, 0))
+                filter_layout = "'ohwi'"
+
+            options = [
+                f"bias: {input_vars[2] if len(input_vars) > 2 else 'undefined'}",
+                f"strides: {strides_js}",
+                f"padding: {pads_js}",
+                f"dilations: {dilations_js}",
+                f"groups: {groups if groups is not None else 'undefined'}",
+                f"outputSizes: {output_sizes_js}"
+            ]
+            if filter_layout:
+                options.append(f"filterLayout: {filter_layout}")
+            if nhwc:
+                options.append("inputLayout: 'nhwc'")
+
             js = f"""const {output_var} = builder.convTranspose2d(
-        {input_vars[0]}, {input_vars[1]},
+        {input_vars[0]}, {filter_var_name},
         {{
-            bias: {input_vars[2] if len(input_vars) > 2 else 'undefined'},
-            strides: {strides_js},
-            padding: {pads_js},
-            dilations: {dilations_js},
-            groups: {groups if groups is not None else 'undefined'},
-            outputSizes: {output_sizes_js}
+            {', '.join(options)}
         }}
     );"""
             return js
@@ -732,12 +761,18 @@ def convert(
                 scales_py = get_initializer_array(scales_name, expected_dtype=1, expected_len=4)
                 scales_js = f"[{float(scales_py[2])}, {float(scales_py[3])}]"
 
+            options = [
+                f"mode: '{webnn_mode}'",
+                f"scales: {scales_js}",
+                f"sizes: {sizes_js}"
+            ]
+            if nhwc:
+                options.append("axes: [1, 2]")
+
             js = f"""const {output_var} = builder.resample2d(
         {input_var},
         {{
-            mode: '{webnn_mode}',
-            scales: {scales_js},
-            sizes: {sizes_js}
+            {', '.join(options)}
         }}
     );"""
             return js
@@ -947,6 +982,7 @@ def convert(
             for i, (output_var, output_info) in enumerate(zip(output_vars, graph_outputs)):
                 dims = output_info.get('type', {}).get('tensorType', {}).get('shape', {}).get('dim', [])
                 if len(dims) == 4:
+                    js_lines.append("    // Transpose output from NHWC TO NCHW.")
                     trans_var = output_var + "_nchw"
                     js_lines.append(f"""    const {trans_var} = builder.transpose(
         {output_var},
@@ -963,14 +999,11 @@ def convert(
 
         # Create tensors for graph outputs.
         js_lines.append("    // Create graph output tensors.")
-        for output_info in graph_outputs:
+        for i, (output_var, output_info) in enumerate(zip(output_vars, graph_outputs)):
             name = output_info['name']
-            dims = output_info.get('type', {}).get('tensorType', {}).get('shape', {}).get('dim', [])
-            dims_str = ', '.join(str(d.get('dimValue', 1)) for d in dims)
-            elem_type = output_info.get('type', {}).get('tensorType', {}).get('elemType', 1)
-            webnn_dtype = webnn_type_map.get(elem_type, 'float32')
+            output_var = output_vars[i]
             js_code = f"""this.outputTensors_['{name}'] = await this.context_.createTensor(
-        {{dataType: '{webnn_dtype}', shape: [{dims_str}], readable: true}}
+        {{dataType: {output_var}.dataType, shape: {output_var}.shape, readable: true}}
     );"""
             js_lines.append("    " + js_code)
 
@@ -1171,7 +1204,7 @@ def main():
         '-nhwc',
         '--nhwc',
         action='store_true',
-        help='Generate WebNN operator, such as conv2d, convTranspose2d and pool2d, take nhwc input layout'
+        help='Generate WebNN operators taking nhwc input layout, including conv2d, convTranspose2d, resample2d and pool2d'
     )
     args = parser.parse_args()
 
