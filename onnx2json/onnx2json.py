@@ -43,6 +43,7 @@ def convert(
     json_indent: Optional[int] = 2,
     external_weights: Optional[bool] = False,
     webnn_js: Optional[bool] = False,
+    nhwc: Optional[bool] = False,
 ):
     """
     Parameters
@@ -209,14 +210,22 @@ def convert(
             elem_type = input_info.get('type', {}).get('tensorType', {}).get('elemType', 1)
             webnn_dtype = webnn_type_map.get(elem_type, 'float32')
             js_var_name = to_js_var_name(name)
-            js_code = f"""const {js_var_name} = builder.input(
+            if nhwc and len(dims) == 4:
+                # Transpose input from NCHW -> NHWC
+                # Compose builder.input and builder.transpose in one line, keeping js_var_name unchanged
+                js_code = f"""const {js_var_name} = builder.transpose(
+        builder.input('{name}', {{dataType: '{webnn_dtype}', shape: [{dims_str}]}}),
+        {{ permutation: [0, 2, 3, 1] }}
+    );"""
+            else:
+                js_code = f"""const {js_var_name} = builder.input(
         '{name}',
         {{dataType: '{webnn_dtype}', shape: [{dims_str}]}}
-    );
-    this.inputTensors_['{name}'] = await this.context_.createTensor(
-        {{dataType: '{webnn_dtype}', shape: [{dims_str}], writable: true}}
     );"""
             js_lines.append("    " + js_code)
+            js_lines.append(f"""    this.inputTensors_['{name}'] = await this.context_.createTensor(
+        {{dataType: '{webnn_dtype}', shape: [{dims_str}], writable: true}}
+    );""")
 
         # Generate all the constant operands
         js_lines.append("    // Create graph constant operands.")
@@ -263,6 +272,8 @@ def convert(
                     py_data = initializer.get("int32Data", [])
                 elif data_type == 9:
                     py_data = initializer.get("int32Data", [])
+                elif data_type == 10:
+                    py_data = initializer.get("float16Data", [])
                 elif data_type == 11:
                     py_data = initializer.get("doubleData", [])
                 elif data_type == 12:
@@ -280,6 +291,61 @@ def convert(
 
         # Generate all the operators
         op_handlers = {}
+
+        # Map ONNX data type to numpy dtype (shared for all helpers)
+        onnx_dtype_to_np = {
+            1: np.float32,   # FLOAT
+            2: np.uint8,     # UINT8
+            3: np.int8,      # INT8
+            4: np.uint16,    # UINT16
+            5: np.int16,     # INT16
+            6: np.int32,     # INT32
+            7: np.int64,     # INT64
+            9: np.int32,     # BOOL (as int32)
+            10: np.float16,  # FLOAT16
+            11: np.float64,  # DOUBLE
+            12: np.uint32,   # UINT32
+            13: np.uint64,   # UINT64
+        }
+
+        # Helper to transpose weights in external weights file
+        def transpose_external_weights(filter_name, permutation):
+            filter_init = next((init for init in initializers if init['name'] == filter_name), None)
+            assert filter_init is not None and "externalData" in filter_init, "Filter must be externalData for NHWC conversion"
+            data_type = filter_init.get("dataType", 1)
+            offset = None
+            length = None
+            for entry in filter_init["externalData"]:
+                if entry["key"] == "offset":
+                    offset = int(entry["value"])
+                elif entry["key"] == "length":
+                    length = int(entry["value"])
+            assert offset is not None and length is not None, "Filter externalData missing offset/length"
+            dims = filter_init.get("dims", [])
+            dims = [int(d) for d in dims]  # Ensure all dims are int
+            assert len(dims) == len(permutation), "Permutation must match filter dimensions"
+
+            np_dtype = onnx_dtype_to_np.get(data_type, np.float32)
+
+            # Read, transpose, and write back, the weights_array_buffer will contain the transposed weights
+            with open(external_data_file_path, "r+b") as f:
+                f.seek(offset)
+                arr = np.frombuffer(f.read(length), dtype=np_dtype).reshape(tuple(dims))
+                arr_transposed = np.transpose(arr, permutation)
+                f.seek(offset)
+                f.write(arr_transposed.astype(np_dtype).tobytes())
+
+            # Generate the JS code to re-create a constant from the transposed weights and return the new constant name
+            permuted_shape = [dims[i] for i in permutation]
+            webnn_dtype = webnn_type_map.get(data_type, 'float32')
+            typed_array = typed_array_map.get(data_type, 'Float32Array')
+            dims_str = ', '.join(str(d) for d in permuted_shape)
+            filter_var_name = to_js_var_name(filter_name)+'_transposed'
+            js_lines.append(f"""const {filter_var_name} = builder.constant(
+        {{dataType: '{webnn_dtype}', shape: [{dims_str}]}},
+        new {typed_array}(weights_array_buffer, {offset}, {length} / {typed_array}.BYTES_PER_ELEMENT)
+    );""")
+            return filter_var_name
 
         # Handler for Conv -> WebNN conv2d
         def handle_conv(node):
@@ -326,14 +392,49 @@ def convert(
             else:
                 dilations_js = "undefined"
             groups = attr_dict.get("group", {}).get("i", None)
+            if groups is not None:
+                groups = int(groups)
+
+            # Check for depthwise conv2d: groups != 1 and groups == output_channel (filter_shape[0])
+            is_depthwise = False
+            filter_name = inputs[1]
+            filter_var_name = input_vars[1]
+            if groups is not None and groups != 1:
+                filter_init = next((init for init in initializers if init['name'] == filter_name), None)
+                filter_shape = filter_init.get("dims", []) if filter_init else []
+                assert len(filter_shape) == 4, f"Conv2d filter '{filter_name}' must have 4 dimensions, got {len(filter_shape)}"
+                output_channels = filter_shape[0]
+                if groups == int(output_channels):
+                    is_depthwise = True
+
+            # NHWC filter transpose: OIHW -> OHWI (normal) or OIHW -> IHWO (depthwise)
+            filter_layout = None
+            if nhwc:
+                if is_depthwise:
+                    # Depthwise: OIHW -> IHWO
+                    filter_var_name = transpose_external_weights(filter_name, (1, 2, 3, 0))
+                    filter_layout = "'ihwo'"
+                else:
+                    # Regular: OIHW -> OHWI
+                    filter_var_name = transpose_external_weights(filter_name, (0, 2, 3, 1))
+                    filter_layout = "'ohwi'"
+
+            options = [
+                f"bias: {input_vars[2] if len(input_vars) > 2 else 'undefined'}",
+                f"strides: {strides_js}",
+                f"padding: {pads_js}",
+                f"dilations: {dilations_js}",
+                f"groups: {groups if groups is not None else 'undefined'}"
+            ]
+            if filter_layout:
+                options.append(f"filterLayout: {filter_layout}")
+            if nhwc:
+                options.append("inputLayout: 'nhwc'")
+
             js = f"""const {output_var} = builder.conv2d(
-        {input_vars[0]}, {input_vars[1]},
+        {input_vars[0]}, {filter_var_name},
         {{
-            bias: {input_vars[2] if len(input_vars) > 2 else 'undefined'},
-            strides: {strides_js},
-            padding: {pads_js},
-            dilations: {dilations_js},
-            groups: {groups if groups is not None else 'undefined'}
+            {', '.join(options)}
         }}
     );"""
             return js
@@ -413,32 +514,10 @@ def convert(
                     elif entry["key"] == "length":
                         length = int(entry["value"])
                 assert offset is not None and length is not None, f"Resize input '{name}' missing offset/length"
+                np_dtype = onnx_dtype_to_np.get(data_type, np.float32)
                 with open(external_data_file_path, "rb") as f:
                     f.seek(offset)
-                    if data_type == 7:
-                        arr = np.frombuffer(f.read(length), dtype=np.int64)
-                    elif data_type == 1:
-                        arr = np.frombuffer(f.read(length), dtype=np.float32)
-                    elif data_type == 2:
-                        arr = np.frombuffer(f.read(length), dtype=np.int32)
-                    elif data_type == 3:
-                        arr = np.frombuffer(f.read(length), dtype=np.int8)
-                    elif data_type == 4:
-                        arr = np.frombuffer(f.read(length), dtype=np.uint16)
-                    elif data_type == 5:
-                        arr = np.frombuffer(f.read(length), dtype=np.int16)
-                    elif data_type == 6:
-                        arr = np.frombuffer(f.read(length), dtype=np.int32)
-                    elif data_type == 9:
-                        arr = np.frombuffer(f.read(length), dtype=np.int32)
-                    elif data_type == 11:
-                        arr = np.frombuffer(f.read(length), dtype=np.float64)
-                    elif data_type == 12:
-                        arr = np.frombuffer(f.read(length), dtype=np.uint32)
-                    elif data_type == 13:
-                        arr = np.frombuffer(f.read(length), dtype=np.uint64)
-                    else:
-                        arr = np.frombuffer(f.read(length), dtype=np.float32)
+                    arr = np.frombuffer(f.read(length), dtype=np_dtype)
                     py = arr.tolist()
             else:
                 # Embedded data
@@ -459,6 +538,8 @@ def convert(
                     py = init.get("int32Data", [])
                 elif data_type == 9:
                     py = init.get("int32Data", [])
+                elif data_type == 10:
+                    py = init.get("float16Data", [])
                 elif data_type == 11:
                     py = init.get("doubleData", [])
                 elif data_type == 12:
@@ -500,6 +581,8 @@ def convert(
                                 arr = value_attr.get("int32Data", [])
                             elif data_type == 9:
                                 arr = value_attr.get("int32Data", [])
+                            elif data_type == 10:
+                                arr = value_attr.get("float16Data", [])
                             elif data_type == 11:
                                 arr = value_attr.get("doubleData", [])
                             elif data_type == 12:
@@ -562,8 +645,11 @@ def convert(
             outputs = node.get("output", [])
             input_vars = [to_js_var_name(i) for i in inputs]
             output_var = to_js_var_name(outputs[0])
+            options = ""
+            if nhwc:
+                options = "{ layout: 'nhwc' }"
             js = f"""const {output_var} = builder.averagePool2d(
-        {input_vars[0]}
+        {input_vars[0]}{', ' + options if options else ''}
     );"""
             return js
 
@@ -714,6 +800,10 @@ def convert(
                 data = value_attr["floatData"]
                 js_data = "[" + ", ".join(str(x) for x in data) + "]"
                 typed_array = "Float32Array"
+            elif "float16Data" in value_attr:
+                data = value_attr["float16Data"]
+                js_data = "[" + ", ".join(str(x) for x in data) + "]"
+                typed_array = "Float16Array"
             elif "int32Data" in value_attr:
                 data = value_attr["int32Data"]
                 js_data = "[" + ", ".join(str(x) for x in data) + "]"
@@ -851,6 +941,19 @@ def convert(
         graph_outputs = onnx_json['graph'].get('output', [])
         output_vars = [to_js_var_name(output['name']) for output in graph_outputs]
         output_names = [output['name'] for output in graph_outputs]
+
+        # If nhwc, insert a transpose from NHWC to NCHW for each output, and replace output_var only after generating the transpose code
+        if nhwc:
+            for i, (output_var, output_info) in enumerate(zip(output_vars, graph_outputs)):
+                dims = output_info.get('type', {}).get('tensorType', {}).get('shape', {}).get('dim', [])
+                if len(dims) == 4:
+                    trans_var = output_var + "_nchw"
+                    js_lines.append(f"""    const {trans_var} = builder.transpose(
+        {output_var},
+        {{ permutation: [0, 3, 1, 2] }}
+    );""")
+                    output_vars[i] = trans_var
+
         if output_vars:
             if len(output_vars) == 1:
                 js_lines.append(f"    this.graph_ = await builder.build({{'{output_names[0]}': {output_vars[0]}}});")
@@ -1064,6 +1167,12 @@ def main():
         action='store_true',
         help='Generate WebNN JavaScript code, must be used together with --external_weights'
     )
+    parser.add_argument(
+        '-nhwc',
+        '--nhwc',
+        action='store_true',
+        help='Generate WebNN operator, such as conv2d, convTranspose2d and pool2d, take nhwc input layout'
+    )
     args = parser.parse_args()
 
     input_onnx_file_path = args.input_onnx_file_path
@@ -1071,6 +1180,7 @@ def main():
     json_indent = args.json_indent
     external_weights = args.external_weights
     webnn_js = args.webnn_js
+    nhwc = args.nhwc
 
     # Convert onnx model to JSON
     onnx_graph = onnx.load(input_onnx_file_path)
@@ -1081,7 +1191,8 @@ def main():
         output_json_path=output_json_path,
         json_indent=json_indent,
         external_weights=external_weights,
-        webnn_js=webnn_js
+        webnn_js=webnn_js,
+        nhwc=nhwc
     )
 
 
