@@ -39,11 +39,10 @@ class Color:
 def convert(
     input_onnx_file_path: Optional[str] = '',
     onnx_graph: Optional[onnx.ModelProto] = None,
-    output_json_path: Optional[str] = '',
-    json_indent: Optional[int] = 2,
-    external_weights: Optional[bool] = False,
-    webnn_js: Optional[bool] = False,
+    output_js_path: Optional[str] = '',
     nhwc: Optional[bool] = False,
+    dump_json: Optional[bool] = False,
+    json_indent: Optional[int] = 2,
 ):
     """
     Parameters
@@ -58,30 +57,26 @@ def convert(
         Either input_onnx_file_path or onnx_graph must be specified.\n\
         onnx_graph If specified, ignore input_onnx_file_path and process onnx_graph.
 
-    output_json_path: Optional[str]
-        Output JSON file path (*.json) If not specified, no JSON file is output.\n\
+    output_js_path: Optional[str]
+        Output WebNN JavaScript file path (*.js) If not specified, no JavaScript file is output.\n\
         Default: ''
-
-    json_indent: Optional[int]
-        Number of indentations in JSON.\n\
-        Default: 2
-
-    external_weights: Optional[bool]
-        Save weights to an external file.\n\
-        Default: False
-
-    webnn_js: Optional[bool]
-        Generate WebNN JavaScript code, must be used together with external_weights.\n\
-        Default: False
 
     nhwc: Optional[bool]
         Generate WebNN operators taking nhwc input layout, including conv2d, convTranspose2d, resample2d and pool2d.\n\
         Default: false
 
+    dump_json: Optional[bool]
+        Dump the JSON representation of ONNX model.\n\
+        Default: False
+
+    json_indent: Optional[int]
+        Number of indentations in JSON.\n\
+        Default: 2
+
     Returns
     -------
-    onnx_json: dict
-        Converted JSON dict.
+    js_lines: str
+        Converted WebNN JavaScript code.
     """
 
     # Unspecified check for input_onnx_file_path and onnx_graph
@@ -92,32 +87,17 @@ def convert(
         )
         sys.exit(1)
 
-    if not external_weights and webnn_js:
-        print(
-            f'{Color.RED}ERROR:{Color.RESET} '+
-            f'Generating WebNN JavaScript depends on saving to external weights file (--external_weights).'
-        )
-        sys.exit(1)
-
-    if not webnn_js and nhwc:
-        print(
-            f'{Color.RED}ERROR:{Color.RESET} '+
-            f'Nchw must be used together with generating WebNN JavaScript (--webnn_js).'
-        )
-        sys.exit(1)
-
     if not onnx_graph:
         onnx_graph = onnx.load(input_onnx_file_path)
 
-    if not external_weights:
-        s = MessageToJson(onnx_graph)
-        onnx_json = json.loads(s)
-
-        if output_json_path:
-            with open(output_json_path, 'w') as f:
-                json.dump(onnx_json, f, indent=json_indent)
+    if not output_js_path:
+        print(
+            f'{Color.RED}ERROR:{Color.RESET} '+
+            f'output_js_path must be specified.'
+        )
+        sys.exit(1)
     else:
-        external_data_file_path = os.path.splitext(output_json_path)[0] + ".bin"
+        external_data_file_path = os.path.splitext(output_js_path)[0] + ".bin"
         # Remove existing external data file before saving
         if os.path.exists(external_data_file_path):
             os.remove(external_data_file_path)
@@ -128,12 +108,10 @@ def convert(
         s = MessageToJson(external_data_model)
         onnx_json = json.loads(s)
 
-        if output_json_path:
+        if dump_json:
+            output_json_path = os.path.splitext(output_js_path)[0] + ".json"
             with open(output_json_path, 'w') as f:
                 json.dump(onnx_json, f, indent=json_indent)
-
-        if not webnn_js:
-            return onnx_json
 
         # Generate WebNN JavaScript code
         js_lines = []
@@ -151,7 +129,7 @@ def convert(
             return js_var_name
 
         # Start Model class
-        class_name = os.path.splitext(os.path.basename(output_json_path))[0]
+        class_name = os.path.splitext(os.path.basename(output_js_path))[0]
         # Convert to valid JS class name (capitalize, remove invalid chars)
         class_name = ''.join([w.capitalize() for w in class_name.replace('-', '_').split('_') if w])
         js_lines.append(f"export class {class_name} {{")
@@ -204,7 +182,7 @@ def convert(
             5: 'Int16Array',     # INT16
             6: 'Int32Array',     # INT32
             7: 'BigInt64Array',     # INT64 (not directly supported in JS)
-            9: 'Bool',           # BOOL (special handling)
+            9: 'Uint8Array',           # BOOL (special handling)
             10: 'Float16Array',  # FLOAT16 (not directly supported in JS)
             11: 'Float64Array',  # DOUBLE
             12: 'Uint32Array',   # UINT32
@@ -1042,16 +1020,15 @@ def convert(
 
         js_lines.append("}")    # end class
 
-        # Write all generated JS code to model.js
-        webnn_js_file_path = os.path.splitext(output_json_path)[0] + ".js"
+        # Write all generated JS code to output_js_path
         # Remove existing webnn js file before saving
-        if os.path.exists(webnn_js_file_path):
-            os.remove(webnn_js_file_path)
-        with open(webnn_js_file_path, "w", encoding="utf-8") as f:
+        if os.path.exists(output_js_path):
+            os.remove(output_js_path)
+        with open(output_js_path, "w", encoding="utf-8") as f:
             f.write('\n\n'.join(js_lines))
 
         # Generate index.html to test the model
-        html_path = os.path.join(os.path.dirname(output_json_path), "index.html")
+        html_path = os.path.join(os.path.dirname(output_js_path), "index.html")
         html_code = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1059,7 +1036,7 @@ def convert(
     <title>Test {class_name}</title>
 </head>
 <body>
-    <h1>Test {webnn_js_file_path}</h1>
+    <h1>Test {output_js_path}</h1>
     <button id="run-btn">Build & Run Model</button>
     <label for="deviceType">Device:</label>
     <select id="deviceType">
@@ -1071,7 +1048,7 @@ def convert(
     <input type="number" id="numRuns" value="1" min="1" style="width: 4em;">
     <pre id="output"></pre>
     <script type="module">
-        import {{ {class_name} }} from './{os.path.basename(webnn_js_file_path)}';
+        import {{ {class_name} }} from './{os.path.basename(output_js_path)}';
 
         document.getElementById('run-btn').onclick = async () => {{
             const output = document.getElementById('output');
@@ -1160,7 +1137,7 @@ def convert(
         with open(html_path, "w", encoding="utf-8") as f:
             f.write(html_code)
 
-        return onnx_json
+        return js_lines
 
 
 def main():
@@ -1174,10 +1151,22 @@ def main():
     )
     parser.add_argument(
         '-oj',
-        '--output_json_path',
+        '--output_js_path',
         type=str,
         required=True,
-        help='Output JSON file path (*.json)'
+        help='Output WebNN JavaScript file path (*.js)'
+    )
+    parser.add_argument(
+        '-nhwc',
+        '--nhwc',
+        action='store_true',
+        help='Generate WebNN operators taking nhwc input layout, including conv2d, convTranspose2d, resample2d and pool2d'
+    )
+    parser.add_argument(
+        '-json',
+        '--dump_json',
+        action='store_true',
+        help='Dump the JSON representation of ONNX model'
     )
     parser.add_argument(
         '-i',
@@ -1186,32 +1175,13 @@ def main():
         default=2,
         help='Number of indentations in JSON. (default=2)'
     )
-    parser.add_argument(
-        '-ew',
-        '--external_weights',
-        action='store_true',
-        help='Store weights to an external file'
-    )
-    parser.add_argument(
-        '-js',
-        '--webnn_js',
-        action='store_true',
-        help='Generate WebNN JavaScript code, must be used together with --external_weights'
-    )
-    parser.add_argument(
-        '-nhwc',
-        '--nhwc',
-        action='store_true',
-        help='Generate WebNN operators taking nhwc input layout, including conv2d, convTranspose2d, resample2d and pool2d'
-    )
     args = parser.parse_args()
 
     input_onnx_file_path = args.input_onnx_file_path
-    output_json_path = args.output_json_path
-    json_indent = args.json_indent
-    external_weights = args.external_weights
-    webnn_js = args.webnn_js
+    output_js_path = args.output_js_path
     nhwc = args.nhwc
+    dump_json = args.dump_json
+    json_indent = args.json_indent
 
     # Convert onnx model to JSON
     onnx_graph = onnx.load(input_onnx_file_path)
@@ -1219,11 +1189,10 @@ def main():
     onnx_json = convert(
         input_onnx_file_path=None,
         onnx_graph=onnx_graph,
-        output_json_path=output_json_path,
+        output_js_path=output_js_path,
+        nhwc=nhwc,
+        dump_json=dump_json,
         json_indent=json_indent,
-        external_weights=external_weights,
-        webnn_js=webnn_js,
-        nhwc=nhwc
     )
 
 
