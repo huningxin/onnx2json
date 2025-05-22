@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 from os import path
 import re
 
-package_name="onnx2json"
+package_name="onnx2webnn"
 root_dir = path.abspath(path.dirname(__file__))
 
 with open("README.md") as f:
@@ -17,19 +17,19 @@ setup(
     name=package_name,
     version=version,
     description=\
-        "Exports the ONNX file to a JSON file or JSON dict.",
+        "Exports the ONNX file to a WebNN JavaScript file and a bin file containing the weights.",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    author="Katsuya Hyodo",
-    author_email="rmsdh122@yahoo.co.jp",
-    url="https://github.com/PINTO0309/onnx2json",
+    author="Ningxin Hu",
+    author_email="ningxin.hu@intel.com",
+    url="https://github.com/huningxin/onnx2webnn",
     license="MIT License",
     packages=find_packages(),
     platforms=["linux", "unix"],
     python_requires=">=3.6",
     entry_points={
         'console_scripts': [
-            "onnx2json=onnx2json:main"
+            "onnx2webnn=onnx2webnn:main"
         ]
     }
 )

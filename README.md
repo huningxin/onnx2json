@@ -1,4 +1,4 @@
-# onnx2js
+# onnx2webnn
 Exports the ONNX file to a WebNN JavaScript file and a bin file containing the weights.
 
 This project is derived from [onnx2json](https://github.com/PINTO0309/onnx2json).
@@ -10,7 +10,7 @@ $ pip install -U onnx protobuf numpy
 ```
 ## CLI Usage
 ```
-usage: onnx2js.py [-h] -if INPUT_ONNX_FILE_PATH -oj OUTPUT_JS_PATH [-nhwc] [-json] [-i JSON_INDENT]
+usage: onnx2webnn.py [-h] -if INPUT_ONNX_FILE_PATH -oj OUTPUT_JS_PATH [-nhwc] [-json] [-i JSON_INDENT]
 
 options:
   -h, --help            show this help message and exit
@@ -37,7 +37,7 @@ $ mkdir mobilenet
 
 Then run the following command to create WebNN JavaScript model for the static ONNX model:
 ```bash
-$ python onnx2js.py -if ../sample_models/mobilenetv2-12-static.onnx -oj mobilenet/mobilenet.js
+$ python onnx2webnn.py -if ../sample_models/mobilenetv2-12-static.onnx -oj mobilenet/mobilenet.js
 ```
 It will generate "mobilenet.bin" and "mobilenet.js" besides "mobilenet.json" in "mobilenet" folder.
 
@@ -53,7 +53,7 @@ The default input layout of ONNX model is NCHW, however some WebNN backends pref
 
 To generate the NHWC WebNN model from an ONNX model, add the "--nhwc" switch, such as
 ```bash
-$ python onnx2js.py -if ../sample_models/mobilenetv2-12-static.onnx -oj mobilenet_nhwc/mobilenet_nhwc.js -nhwc
+$ python onnx2webnn.py -if ../sample_models/mobilenetv2-12-static.onnx -oj mobilenet_nhwc/mobilenet_nhwc.js -nhwc
 ```
 
 WebNN API exposes the backend preferred layout via [`MLContext.opSupportLimit().preferredInputLayout`](https://www.w3.org/TR/webnn/#dom-mlopsupportlimits-preferredinputlayout), a web app can load the corresponding WebNN model based on the preferred layout. For example, in JavaScript code
@@ -75,5 +75,5 @@ await webnnModel.build({deviceType});
 ## Dump JSON
 You can also dump the JSON file for debugging purpose.
 ```bash
-$ python onnx2js.py -if ../sample_models/mobilenetv2-12-static.onnx -oj mobilenet/mobilenet.js -json
+$ python onnx2webnn.py -if ../sample_models/mobilenetv2-12-static.onnx -oj mobilenet/mobilenet.js -json
 ```
