@@ -151,5 +151,34 @@ Start a node.js http-server in the folder containing generated model files and l
 $ http-server
 ```
 
+### 6.1 Generate NHWC WebNN model
+The default input layout of ONNX model is NCHW, however some WebNN backends prefer to NHWC input layout, such as TFLite for CPU and GPU. For those backends, using WebNN NHWC model may have better performance.
+
+NHWC conversion reorders the external weights file that depends on "numpy" package.
+```bash
+$ pip install numpy
+```
+
+To generate the NHWC WebNN model from an ONNX model, add the "--nhwc" switch, such as
+```bash
+$ onnx2json -if ../sample_models/mobilenetv2-12-static.onnx -oj mobilenet_nhwc/mobilenet_nhwc.json -ew -js -nhwc
+```
+
+WebNN API exposes the backend preferred layout via [`MLContext.opSupportLimit().preferredInputLayout`](https://www.w3.org/TR/webnn/#dom-mlopsupportlimits-preferredinputlayout), a web app can load the corresponding WebNN model based on the preferred layout. For example, in JavaScript code
+```javascript
+const deviceType = 'gpu'; // or 'cpu', 'npu'
+const context = await navigator.ml.createContext({deviceType});
+const layout = context.opSupportLimits().preferredInputLayout;
+let webnnModel;
+if (layout == 'nhwc') {
+    webnnModel = new MobilenetNhwc();
+} else {
+    webnnModel = new Mobilenet();
+}
+// Load the weights in preferred layout and build the graph.
+await webnnModel.build({deviceType});
+// Do inference with webnnModel.run()
+```
+
 ## 7. Issues
 https://github.com/PINTO0309/simple-onnx-processing-tools/issues
