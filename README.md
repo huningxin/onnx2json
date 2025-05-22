@@ -52,6 +52,9 @@ optional arguments:
 
   -js, --webnn_js
       Generate WebNN JavaScript code, must be used together with --external_weights
+
+  -nhwc, --nhwc
+      Generate WebNN operators taking nhwc input layout, including conv2d, convTranspose2d, resample2d and pool2d
 ```
 
 ## 3. In-script Usage
@@ -95,6 +98,10 @@ convert(
     webnn_js: Optional[bool]
         Generate WebNN JavaScript code, must be used together with external_weights.
         Default: False
+
+    nhwc: Optional[bool]
+        Generate WebNN operators taking nhwc input layout, including conv2d, convTranspose2d, resample2d and pool2d.\n\
+        Default: false
 
     Returns
     -------
