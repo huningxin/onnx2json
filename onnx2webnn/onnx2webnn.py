@@ -189,6 +189,41 @@ def convert(
             13: 'BigUint64Array',   # UINT64 (not directly supported in JS)
         }
 
+        # Helper to extract embedded data from an initializer as a Python array
+        def get_initializer_embedded_data(initializer):
+            """
+            Returns the embedded data of an initializer as a Python array,
+            handling all ONNX data types including float16.
+            """
+            data_type = initializer.get("dataType", 1)
+            if data_type == 1:  # FLOAT
+                return initializer.get("floatData", [])
+            elif data_type == 2:  # UINT8
+                return initializer.get("uint8Data", [])
+            elif data_type == 3:  # INT8
+                return initializer.get("int8Data", [])
+            elif data_type == 4:  # UINT16
+                return initializer.get("uint16Data", [])
+            elif data_type == 5:  # INT16
+                return initializer.get("int16Data", [])
+            elif data_type == 6:  # INT32
+                return initializer.get("int32Data", [])
+            elif data_type == 7:  # INT64
+                return initializer.get("int64Data", [])
+            elif data_type == 9:  # BOOL (stored as int32Data)
+                return initializer.get("int32Data", [])
+            elif data_type == 10:  # FLOAT16 (stored as uint16, convert to float16 then to float32 for JS)
+                raw_data = initializer.get("float16Data", [])
+                return np.array(raw_data, dtype=np.uint16).view(np.float16).astype(np.float32).tolist() if raw_data else []
+            elif data_type == 11:  # DOUBLE
+                return initializer.get("doubleData", [])
+            elif data_type == 12:  # UINT32
+                return initializer.get("uint32Data", [])
+            elif data_type == 13:  # UINT64
+                return initializer.get("uint64Data", [])
+            else:
+                return []
+
         # Generate all the constant operands
         js_lines.append("    // Create graph constant operands.")
         initializers = onnx_json['graph'].get('initializer', [])
@@ -218,32 +253,7 @@ def convert(
     );"""
             else:
                 # Create a constant operand from values
-                if data_type == 7:
-                    py_data = initializer.get("int64Data", [])
-                elif data_type == 1:
-                    py_data = initializer.get("floatData", [])
-                elif data_type == 2:
-                    py_data = initializer.get("int32Data", [])
-                elif data_type == 3:
-                    py_data = initializer.get("int8Data", [])
-                elif data_type == 4:
-                    py_data = initializer.get("uint16Data", [])
-                elif data_type == 5:
-                    py_data = initializer.get("int16Data", [])
-                elif data_type == 6:
-                    py_data = initializer.get("int32Data", [])
-                elif data_type == 9:
-                    py_data = initializer.get("int32Data", [])
-                elif data_type == 10:
-                    py_data = initializer.get("float16Data", [])
-                elif data_type == 11:
-                    py_data = initializer.get("doubleData", [])
-                elif data_type == 12:
-                    py_data = initializer.get("uint32Data", [])
-                elif data_type == 13:
-                    py_data = initializer.get("uint64Data", [])
-                else:
-                    py_data = []
+                py_data = get_initializer_embedded_data(initializer)
                 js_data = "[" + ", ".join(str(x) for x in py_data) + "]"
                 js_code = f"""const {js_var_name} = builder.constant(
         {{dataType: '{webnn_dtype}', shape: [{dims_str}]}},
@@ -508,11 +518,11 @@ def convert(
         # Helper to extract array from initializer (externalData or embedded)
         def get_initializer_array(name, expected_dtype, expected_len=None):
             init = next((init for init in initializers if init['name'] == name), None)
-            assert init is not None, f"Resize input '{name}' must be an initializer"
+            assert init is not None, f"'{name}' must be an initializer"
+            data_type = init.get("dataType", 1)
+            assert data_type == expected_dtype, f"Initializer '{name}' must be dataType={expected_dtype}, got {data_type}"
             # External data
             if "externalData" in init:
-                data_type = init.get("dataType", 1)
-                assert data_type == expected_dtype, f"Resize input '{name}' must be dataType={expected_dtype}, got {data_type}"
                 offset = None
                 length = None
                 for entry in init["externalData"]:
@@ -528,35 +538,9 @@ def convert(
                     py = arr.tolist()
             else:
                 # Embedded data
-                data_type = init.get("dataType", 1)
-                if data_type == 7:
-                    py = init.get("int64Data", [])
-                elif data_type == 1:
-                    py = init.get("floatData", [])
-                elif data_type == 2:
-                    py = init.get("int32Data", [])
-                elif data_type == 3:
-                    py = init.get("int8Data", [])
-                elif data_type == 4:
-                    py = init.get("uint16Data", [])
-                elif data_type == 5:
-                    py = init.get("int16Data", [])
-                elif data_type == 6:
-                    py = init.get("int32Data", [])
-                elif data_type == 9:
-                    py = init.get("int32Data", [])
-                elif data_type == 10:
-                    py = init.get("float16Data", [])
-                elif data_type == 11:
-                    py = init.get("doubleData", [])
-                elif data_type == 12:
-                    py = init.get("uint32Data", [])
-                elif data_type == 13:
-                    py = init.get("uint64Data", [])
-                else:
-                    py = []
+                py = get_initializer_embedded_data(init)
             if expected_len is not None:
-                assert len(py) == expected_len, f"Resize only supports {name} of length {expected_len}, got {len(py)}"
+                assert len(py) == expected_len, f"Expect {name} of length {expected_len}, got {len(py)}"
             return py
         
         # Helper to extract array from Constant node in the graph
@@ -572,29 +556,30 @@ def convert(
                             data_type = value_attr.get("dataType", None)
                             assert data_type == expected_dtype, f"Constant node '{name}' must have dataType={expected_dtype}, got {data_type}"
                             # Extract array based on data_type
-                            if data_type == 7:
-                                arr = value_attr.get("int64Data", [])
-                            elif data_type == 1:
+                            if data_type == 1:  # FLOAT
                                 arr = value_attr.get("floatData", [])
-                            elif data_type == 2:
-                                arr = value_attr.get("int32Data", [])
-                            elif data_type == 3:
+                            elif data_type == 2:  # UINT8
+                                arr = value_attr.get("uint8Data", [])
+                            elif data_type == 3:  # INT8
                                 arr = value_attr.get("int8Data", [])
-                            elif data_type == 4:
+                            elif data_type == 4:  # UINT16
                                 arr = value_attr.get("uint16Data", [])
-                            elif data_type == 5:
+                            elif data_type == 5:  # INT16
                                 arr = value_attr.get("int16Data", [])
-                            elif data_type == 6:
+                            elif data_type == 6:  # INT32
                                 arr = value_attr.get("int32Data", [])
-                            elif data_type == 9:
+                            elif data_type == 7:  # INT64
+                                arr = value_attr.get("int64Data", [])
+                            elif data_type == 9:  # BOOL (stored as int32Data)
                                 arr = value_attr.get("int32Data", [])
-                            elif data_type == 10:
-                                arr = value_attr.get("float16Data", [])
-                            elif data_type == 11:
+                            elif data_type == 10:  # FLOAT16 (stored as uint16, convert to float16 then to float32 for JS)
+                                raw_data = value_attr.get("float16Data", [])
+                                arr = np.array(raw_data, dtype=np.uint16).view(np.float16).astype(np.float32).tolist() if raw_data else []
+                            elif data_type == 11:  # DOUBLE
                                 arr = value_attr.get("doubleData", [])
-                            elif data_type == 12:
+                            elif data_type == 12:  # UINT32
                                 arr = value_attr.get("uint32Data", [])
-                            elif data_type == 13:
+                            elif data_type == 13:  # UINT64
                                 arr = value_attr.get("uint64Data", [])
                             else:
                                 arr = []
