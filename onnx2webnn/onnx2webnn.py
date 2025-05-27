@@ -199,9 +199,9 @@ def convert(
             if data_type == 1:  # FLOAT
                 return initializer.get("floatData", [])
             elif data_type == 2:  # UINT8
-                return initializer.get("uint8Data", [])
+                return initializer.get("int32Data", [])
             elif data_type == 3:  # INT8
-                return initializer.get("int8Data", [])
+                return initializer.get("int32Data", [])
             elif data_type == 4:  # UINT16
                 return initializer.get("uint16Data", [])
             elif data_type == 5:  # INT16
@@ -348,6 +348,70 @@ def convert(
     );""")
             return filter_var_name
 
+        # Helper to fetch a tensor shape from valueInfo in the ONNX JSON.
+        # ONNX Simplifier will do shape inference and add value info for each output tensor.
+        def get_valueinfo_shape(name):
+            """
+            Returns the shape of a tensor given its name by searching valueInfo in the ONNX JSON.
+            The shape is returned as a list of integers.
+            """
+            def extract_shape(info):
+                tensor_type = info.get('type', {}).get('tensorType', None)
+                assert tensor_type is not None, f"valueInfo for '{name}' is not a tensorType"
+                dims = tensor_type.get('shape', {}).get('dim', [])
+                return [int(d.get('dimValue', 1)) for d in dims]
+
+            # Search valueInfo
+            for vi in onnx_json['graph'].get('valueInfo', []):
+                if vi['name'] == name:
+                    return extract_shape(vi)
+            # Search inputs
+            for vi in onnx_json['graph'].get('input', []):
+                if vi['name'] == name:
+                    return extract_shape(vi)
+            # Search outputs
+            for vi in onnx_json['graph'].get('output', []):
+                if vi['name'] == name:
+                    return extract_shape(vi)
+            return []
+
+        # Helper to fetch a tensor shape by tensor name.
+        # If the tensor is an initializer, get its shape from the initializer.
+        # Otherwise, get its shape from valueInfo.
+        def get_tensor_shape(name):
+            """
+            Returns the shape of a tensor given its name.
+            If the tensor is an initializer, returns its 'dims'.
+            Otherwise, uses get_valueinfo_shape to get the shape from valueInfo.
+            """
+            for init in initializers:
+                if init['name'] == name:
+                    return [int(d) for d in init.get('dims', [])]
+            return get_valueinfo_shape(name)
+
+        # Helper to fetch a tensor data type by tensor name.
+        # If the tensor is an initializer, get its data type from the initializer.
+        # Otherwise, get its data type from valueInfo.
+        def get_tensor_dtype(name):
+            """
+            Returns the ONNX data type (int) of a tensor given its name.
+            If the tensor is an initializer, returns its 'dataType'.
+            Otherwise, uses valueInfo to get the elemType.
+            """
+            for init in initializers:
+                if init['name'] == name:
+                    return init.get('dataType', 1)
+            for vi in onnx_json['graph'].get('valueInfo', []):
+                if vi['name'] == name:
+                    return vi.get('type', {}).get('tensorType', {}).get('elemType', 1)
+            for vi in onnx_json['graph'].get('input', []):
+                if vi['name'] == name:
+                    return vi.get('type', {}).get('tensorType', {}).get('elemType', 1)
+            for vi in onnx_json['graph'].get('output', []):
+                if vi['name'] == name:
+                    return vi.get('type', {}).get('tensorType', {}).get('elemType', 1)
+            return 1  # Default to float32 if not found
+
         # Handler for Conv -> WebNN conv2d
         def handle_conv(node):
             inputs = node.get("input", [])
@@ -401,8 +465,7 @@ def convert(
             filter_name = inputs[1]
             filter_var_name = input_vars[1]
             if groups is not None and groups != 1:
-                filter_init = next((init for init in initializers if init['name'] == filter_name), None)
-                filter_shape = filter_init.get("dims", []) if filter_init else []
+                filter_shape = get_tensor_shape(filter_name)
                 assert len(filter_shape) == 4, f"Conv2d filter '{filter_name}' must have 4 dimensions, got {len(filter_shape)}"
                 output_channels = filter_shape[0]
                 if groups == int(output_channels):
@@ -516,11 +579,12 @@ def convert(
             return js
 
         # Helper to extract array from initializer (externalData or embedded)
-        def get_initializer_array(name, expected_dtype, expected_len=None):
+        def get_initializer_array(name, expected_dtype=None, expected_len=None):
             init = next((init for init in initializers if init['name'] == name), None)
             assert init is not None, f"'{name}' must be an initializer"
             data_type = init.get("dataType", 1)
-            assert data_type == expected_dtype, f"Initializer '{name}' must be dataType={expected_dtype}, got {data_type}"
+            if expected_dtype is not None:
+                assert data_type == expected_dtype, f"Initializer '{name}' must be dataType={expected_dtype}, got {data_type}"
             # External data
             if "externalData" in init:
                 offset = None
@@ -559,9 +623,9 @@ def convert(
                             if data_type == 1:  # FLOAT
                                 arr = value_attr.get("floatData", [])
                             elif data_type == 2:  # UINT8
-                                arr = value_attr.get("uint8Data", [])
+                                arr = value_attr.get("int32Data", [])
                             elif data_type == 3:  # INT8
-                                arr = value_attr.get("int8Data", [])
+                                arr = value_attr.get("int32Data", [])
                             elif data_type == 4:  # UINT16
                                 arr = value_attr.get("uint16Data", [])
                             elif data_type == 5:  # INT16
@@ -901,16 +965,126 @@ def convert(
     );"""
             return js
 
+        js_var_set = set()  # Track created JS variable names for reshaped scale and zero points.
+
+        # Handler for DequantizeLinear and QuantizeLinear
+        def make_qdq_handler(op):
+            def handler(node):
+                inputs = node.get("input", [])
+                outputs = node.get("output", [])
+                input_vars = [to_js_var_name(i) for i in inputs]
+                output_var = to_js_var_name(outputs[0])
+
+                # Get axis
+                axis = 1  # ONNX default axis is 1
+                for attr in node.get("attribute", []):
+                    if attr.get("name") == "axis":
+                        axis = int(attr.get("i", 1))
+                        break
+
+                # WebNN: builder.dequantizeLinear(x, scale, zeroPoint)
+                # ONNX: input, scale, zero_point (optional)
+                input_shape = get_tensor_shape(inputs[0])
+                scale_shape = get_tensor_shape(inputs[1])
+                zero_point_shape = None
+                input_vars_zp = None
+                if len(inputs) > 2:
+                    zero_point_shape = get_tensor_shape(inputs[2])
+                    input_vars_zp = input_vars[2]
+                
+                # print(f"dequantizeLinear {outputs[0]} inputs {inputs[0]}: {input_shape}, {inputs[1]}: {scale_shape}, {inputs[2]}: {zero_point_shape}")
+
+                # WebNN requires scale and zeroPoint have the same rank as input
+                # If scale rank != input rank, expand scale shape for WebNN
+                if len(scale_shape) != len(input_shape):
+                    # Assert scale is an initializer
+                    scale_name = inputs[1]
+                    assert any(init['name'] == scale_name for init in initializers), f"DequantizeLinear scale '{scale_name}' must be an initializer"
+                    assert scale_shape == [] or len(scale_shape) == 1, f"DequantizeLinear scale shape must be scalar or 1D if not matching input rank, got {scale_shape}"
+                    # Create new shape: all 1s, except axis
+                    new_shape = [1] * len(input_shape)
+                    if scale_shape:  # not scalar
+                        new_shape[axis] = scale_shape[0]
+                    # Recreate constant for scale with new shape if not already created
+                    # Encode shape into js var name
+                    shape_str = "_".join(str(x) for x in new_shape)
+                    scale_js_var = f"{to_js_var_name(scale_name)}_reshaped_{shape_str}"
+                    if scale_js_var not in js_var_set:
+                        scale_init = next(init for init in initializers if init['name'] == scale_name)
+                        scale_data = get_initializer_array(scale_name)
+                        scale_dtype = webnn_type_map.get(scale_init.get("dataType", 1), 'float32')
+                        scale_typed_array = typed_array_map.get(scale_init.get("dataType", 1), 'Float32Array')
+                        js_lines.append(f"""    const {scale_js_var} = builder.constant(
+        {{dataType: '{scale_dtype}', shape: [{', '.join(str(x) for x in new_shape)}]}},
+        new {scale_typed_array}([{', '.join(str(x) for x in scale_data)}])
+    );""")
+                        js_var_set.add(scale_js_var)
+                    input_vars[1] = scale_js_var
+
+                    # Reset the scale_shape, it could be used to create zero point if it
+                    # is not present
+                    scale_shape = new_shape
+
+                    # Do the same for zero point if it is present
+                    if len(inputs) == 3:
+                        zero_point_name = inputs[2]
+                        zero_point_js_var = f"{to_js_var_name(zero_point_name)}_reshaped_{shape_str}"
+                        if zero_point_js_var not in js_var_set:
+                            assert any(init['name'] == zero_point_name for init in initializers), f"DequantizeLinear zero_point '{zero_point_name}' must be an initializer"
+                            zero_point_init = next(init for init in initializers if init['name'] == zero_point_name)
+                            zero_point_data = get_initializer_array(zero_point_name)
+                            zero_point_dtype = webnn_type_map.get(zero_point_init.get("dataType", 1), 'float32')
+                            zero_point_typed_array = typed_array_map.get(zero_point_init.get("dataType", 1), 'Float32Array')
+                            js_lines.append(f"""    const {zero_point_js_var} = builder.constant(
+        {{dataType: '{zero_point_dtype}', shape: [{', '.join(str(x) for x in new_shape)}]}},
+        new {zero_point_typed_array}([{', '.join(str(x) for x in zero_point_data)}])
+    );""")
+                            js_var_set.add(zero_point_js_var)
+                        input_vars_zp = zero_point_js_var
+
+                # Create a WebNN constant with value 0 and in shape of scale if zeroPoint is not present
+                if len(inputs) == 2:
+                    zero_point_shape = scale_shape
+                    # Use get_tensor_dtype for zero_point dtype
+                    zero_point_dtype_id = None
+                    if op == "dequantizeLinear":
+                        zero_point_dtype_id = get_tensor_dtype(inputs[0])
+                    else:
+                        assert op == "quantizeLinear", "Only support quantizeLinear or dequantizeLinear for QDQ handler"
+                        zero_point_dtype_id = get_tensor_dtype(outputs[0])
+                    zero_point_dtype = webnn_type_map.get(zero_point_dtype_id, 'float32')
+                    zero_point_typed_array = typed_array_map.get(zero_point_dtype_id, 'Float32Array')
+                    zero_point_js_var = to_js_var_name(input_vars[0]) + "_zero_point"
+                    zero_point_data = [0] * (np.prod(zero_point_shape) if zero_point_shape else 1)
+                    js_lines.append(f"""    const {zero_point_js_var} = builder.constant(
+        {{dataType: '{zero_point_dtype}', shape: [{', '.join(str(x) for x in zero_point_shape)}]}},
+        new {zero_point_typed_array}([{', '.join(str(x) for x in zero_point_data)}])
+    );""")
+                    input_vars_zp = zero_point_js_var
+
+                assert input_vars_zp is not None
+
+                js = f"""const {output_var} = builder.{op}(
+        {input_vars[0]},
+        {input_vars[1]},
+        {input_vars_zp}
+    );"""
+                return js
+            return handler
+
         # Register handlers
         op_handlers["Add"] = make_binary_handler("add")
         op_handlers["Clip"] = handle_clip
         op_handlers["Constant"] = handle_constant
         op_handlers["Conv"] = handle_conv
         op_handlers["ConvTranspose"] = handle_convtranspose
+        op_handlers["DequantizeLinear"] = make_qdq_handler("dequantizeLinear")
         op_handlers["Div"] = make_binary_handler("div")
         op_handlers["Gemm"] = handle_gemm
         op_handlers["GlobalAveragePool"] = handle_globalaveragepool
+        op_handlers["MatMul"] = make_binary_handler("matmul")
         op_handlers["Mul"] = make_binary_handler("mul")
+        op_handlers["QuantizeLinear"] = make_qdq_handler("quantizeLinear")
         op_handlers["Relu"] = make_unary_handler("relu")
         op_handlers["Reshape"] = handle_reshape
         op_handlers["Resize"] = handle_resize
