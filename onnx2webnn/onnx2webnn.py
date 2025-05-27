@@ -289,6 +289,29 @@ def convert(
         {{dataType: '{webnn_dtype}', shape: [{dims_str}], writable: true}}
     );""")
 
+        # Record the DequantizeLinear nodes by their output name
+        # It will be used by conv2d to find the real filter constant through dequantizeLinear op
+        dequantizelinear_outputs = {}
+        if "graph" in onnx_json and "node" in onnx_json["graph"]:
+            for node in onnx_json["graph"]["node"]:
+                if node.get("opType", "") == "DequantizeLinear":
+                    outputs = node.get("output", [])
+                    assert len(outputs) == 1, f"DequantizeLinear node must have exactly one output, got {len(outputs)}"
+                    dequantizelinear_outputs[outputs[0]] = node
+
+        # Helper to find the first input name of a DequantizeLinear node by its output name
+        def find_dequantizelinear_input_by_output(output_name):
+            """
+            Given the output name of a DequantizeLinear node, return its first input name.
+            Returns None if not found.
+            """
+            node = dequantizelinear_outputs.get(output_name)
+            if node:
+                inputs = node.get("input", [])
+                if inputs:
+                    return inputs[0]
+            return None
+
         # Generate all the operators
         op_handlers = {}
 
@@ -311,7 +334,7 @@ def convert(
         # Helper to transpose weights in external weights file
         def transpose_external_weights(filter_name, permutation):
             filter_init = next((init for init in initializers if init['name'] == filter_name), None)
-            assert filter_init is not None and "externalData" in filter_init, "Filter must be externalData for NHWC conversion"
+            assert filter_init is not None and "externalData" in filter_init, f"Filter {filter_name} must be externalData for NHWC conversion"
             data_type = filter_init.get("dataType", 1)
             offset = None
             length = None
@@ -473,15 +496,39 @@ def convert(
 
             # NHWC filter transpose: OIHW -> OHWI (normal) or OIHW -> IHWO (depthwise)
             filter_layout = None
+            dq_input = None
             if nhwc:
+                filter_name_for_transpose = None
+                # If filter_name is not an initializer, try to find the DequantizeLinear input
+                filter_is_initializer = any(init['name'] == filter_name for init in initializers)
+                if not filter_is_initializer:
+                    dq_input = find_dequantizelinear_input_by_output(filter_name)
+                    assert dq_input is not None, f"Cannot find initializer or DequantizeLinear input for filter '{filter_name}'"
+                    filter_name_for_transpose = dq_input
+                else:
+                    filter_name_for_transpose = filter_name
+
                 if is_depthwise:
                     # Depthwise: OIHW -> IHWO
-                    filter_var_name = transpose_external_weights(filter_name, (1, 2, 3, 0))
+                    filter_var_name = transpose_external_weights(filter_name_for_transpose, (1, 2, 3, 0))
                     filter_layout = "'ihwo'"
                 else:
                     # Regular: OIHW -> OHWI
-                    filter_var_name = transpose_external_weights(filter_name, (0, 2, 3, 1))
+                    filter_var_name = transpose_external_weights(filter_name_for_transpose, (0, 2, 3, 1))
                     filter_layout = "'ohwi'"
+
+                # If filter_name was not an initializer, recreate WebNN dequantizeLinear op for the filter_var_name
+                if dq_input is not None:
+                    # Find the DequantizeLinear node for filter_name
+                    dq_node = dequantizelinear_outputs.get(filter_name)
+                    assert dq_node is not None, f"Cannot find DequantizeLinear node for filter '{filter_name}'"
+                    # Replace the first input of the dq_node with filter_var_name
+                    dq_node = dict(dq_node)  # Make a shallow copy to avoid mutating the original
+                    dq_node["input"] = [filter_var_name] + dq_node["input"][1:]
+                    dq_node["output"][0] = dq_node["output"][0] + "_transposed"
+                    dq_js = op_handlers["DequantizeLinear"](dq_node)
+                    js_lines.append(f"    {dq_js}")
+                    filter_var_name = to_js_var_name(dq_node["output"][0])
 
             options = [
                 f"bias: {input_vars[2] if len(input_vars) > 2 else 'undefined'}",
