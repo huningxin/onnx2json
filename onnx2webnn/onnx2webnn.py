@@ -97,6 +97,11 @@ def convert(
         )
         sys.exit(1)
     else:
+        opset = onnx_graph.opset_import[0].version
+        print(
+            f'{Color.GREEN}INFO:{Color.RESET} '+
+            f'The opset of the ONNX model is: {opset}.'
+        )
         external_data_file_path = os.path.splitext(output_js_path)[0] + ".bin"
         # Remove existing external data file before saving
         if os.path.exists(external_data_file_path):
@@ -142,18 +147,20 @@ def convert(
         js_lines.append("")
         js_lines.append("  async build(contextOptions) {")
 
-        # JavaScript code to load weights
-        js_lines.append(f"""    // Load weights ArrayBuffer from {os.path.basename(external_data_file_path)}
-    async function loadWeightsArrayBuffer() {{
-        const response = await fetch('{os.path.basename(external_data_file_path)}');
-        if (!response.ok) {{
-            throw new Error('Failed to fetch weights: ' + response.statusText);
+        if os.path.exists(external_data_file_path):
+            # JavaScript code to load weights
+            js_lines.append(f"""    // Load weights ArrayBuffer from {os.path.basename(external_data_file_path)}
+        async function loadWeightsArrayBuffer() {{
+            const response = await fetch('{os.path.basename(external_data_file_path)}');
+            if (!response.ok) {{
+                throw new Error('Failed to fetch weights: ' + response.statusText);
+            }}
+            return await response.arrayBuffer();
         }}
-        return await response.arrayBuffer();
-    }}
 
-    const weights_array_buffer = await loadWeightsArrayBuffer();
-
+        const weights_array_buffer = await loadWeightsArrayBuffer();
+""")
+        js_lines.append(f"""
     this.context_ = await navigator.ml.createContext(contextOptions);
     const builder = new MLGraphBuilder(this.context_);
 """)
@@ -255,6 +262,8 @@ def convert(
                 # Create a constant operand from values
                 py_data = get_initializer_embedded_data(initializer)
                 js_data = "[" + ", ".join(str(x) for x in py_data) + "]"
+                if webnn_dtype == "int64":
+                    js_data = "[" + ", ".join(str(x + "n") for x in py_data) + "]"
                 js_code = f"""const {js_var_name} = builder.constant(
         {{dataType: '{webnn_dtype}', shape: [{dims_str}]}},
         new {typed_array}({js_data})
@@ -434,6 +443,13 @@ def convert(
                 if vi['name'] == name:
                     return vi.get('type', {}).get('tensorType', {}).get('elemType', 1)
             return 1  # Default to float32 if not found
+
+        def handle_negative_axis(axis, input_rank):
+            if axis < 0:
+                axis += input_rank
+            if axis < 0 or axis >= input_rank:
+                raise ValueError(f"Axis {axis} is out of bounds for input rank {input_rank}.")
+            return axis
 
         # Handler for Conv -> WebNN conv2d
         def handle_conv(node):
@@ -630,8 +646,13 @@ def convert(
             init = next((init for init in initializers if init['name'] == name), None)
             assert init is not None, f"'{name}' must be an initializer"
             data_type = init.get("dataType", 1)
+
             if expected_dtype is not None:
-                assert data_type == expected_dtype, f"Initializer '{name}' must be dataType={expected_dtype}, got {data_type}"
+                # Ensure expected_dtype can be a single type or a tuple of types
+                if not isinstance(expected_dtype, (tuple, list)):
+                    expected_dtype = (expected_dtype,)
+                if data_type not in expected_dtype:
+                    raise AssertionError(f"Initializer '{name}' must be dataType={expected_dtype}, got {data_type}")
             # External data
             if "externalData" in init:
                 offset = None
@@ -641,7 +662,7 @@ def convert(
                         offset = int(entry["value"])
                     elif entry["key"] == "length":
                         length = int(entry["value"])
-                assert offset is not None and length is not None, f"Resize input '{name}' missing offset/length"
+                assert offset is not None and length is not None, f"Input '{name}' missing offset/length"
                 np_dtype = onnx_dtype_to_np.get(data_type, np.float32)
                 with open(external_data_file_path, "rb") as f:
                     f.seek(offset)
@@ -919,7 +940,7 @@ def convert(
                 typed_array = "Int32Array"
             elif "int64Data" in value_attr:
                 data = value_attr["int64Data"]
-                js_data = "[" + ", ".join(str(x) for x in data) + "]"
+                js_data = "[" + ", ".join(str(x + "n") for x in data) + "]"
                 typed_array = "BigInt64Array"
             elif "int8Data" in value_attr:
                 data = value_attr["int8Data"]
@@ -1118,6 +1139,101 @@ def convert(
     );"""
                 return js
             return handler
+        # Handler for Pad -> WebNN pad
+        def handle_pad(node):
+            inputs = node.get("input", [])
+            outputs = node.get("output", [])
+            attrs = node.get("attribute", [])
+            input_var = to_js_var_name(inputs[0])
+            output_var = to_js_var_name(outputs[0])
+            input_tensor = get_tensor_shape(inputs[0])
+            if input_tensor is None:
+                raise AssertionError(f"Cannot get shape of input tensor '{inputs[0]}'.")
+            input_rank = len(input_tensor)
+            pads = None
+            axes_py = None
+
+            # Default mode is 'constant'
+            mode = "constant"
+            # Default value is 0.0
+            value = 0.0
+            for attr in attrs:
+                if attr.get("name") == "mode" and "s" in attr:
+                    try:
+                        mode_str = base64.b64decode(attr["s"]).decode("utf-8")
+                    except Exception:
+                        mode_str = attr["s"]
+                    mode = mode_str.lower()
+                # Before Opset 11, constant value is in 'value' attribute
+                # pads value is in 'pads' attribute
+                elif attr.get("name") == "value" and "f" in attr:
+                    value = attr["f"]
+                elif attr.get("name") == "pads" and "ints" in attr: # Pad - 2
+                    pads = attr["ints"]
+                elif attr.get("name") == "paddings" and "ints" in attr: # Pad - 1
+                    pads = attr["ints"]
+
+
+            # Map ONNX mode to WebNN mode
+            if mode == "constant":
+                webnn_mode = "constant"
+            elif mode == "reflect":
+                webnn_mode = "reflection"
+            elif mode == "edge":
+                webnn_mode = "edge"
+            else:
+                raise AssertionError(f"WebNN does not support {mode} mode for Pad.")
+
+            # Since Opset 11, pads and constant_value are inputs, and must be constants
+            if opset >= 11:
+                # pads is provided as constant
+                if len(inputs) > 1 and inputs[1]:
+                    pads_name = inputs[1]
+                    pads = get_initializer_array(pads_name, expected_dtype=7)
+                # constant_value is provided as consant
+                if len(inputs) > 2 and inputs[2]:
+                    value_name = inputs[2]
+                    value_py = get_initializer_array(value_name, expected_dtype=1, expected_len=1)
+                    value = float(value_py[0])
+                # axes is provided as constant
+                if len(inputs) > 3 and inputs[3]:
+                    axes_name = inputs[3]
+                    axes_py = get_initializer_array(axes_name, expected_dtype=[6, 7])
+                    # Handle negative axis
+                    axes_py = [handle_negative_axis(int(axis), input_rank) for axis in axes_py]
+
+            beginning_padding = [0] * input_rank
+            ending_padding = [0] * input_rank
+            if axes_py is not None:
+                # If axes is provided, use it to determine beginning and ending padding
+                for i in range(len(axes_py)):
+                    index = axes_py[i]
+                    beginning_padding[index] = pads[i]
+                    ending_padding[index] = pads[i + len(pads) // 2]
+            else:
+                beginning_padding = pads[:len(pads) // 2]
+                ending_padding = pads[len(pads) // 2:]
+
+            # Clamp negative pads to 0
+            beginning_padding = [max(0, int(pad)) for pad in beginning_padding]
+            ending_padding = [max(0, int(pad)) for pad in ending_padding]
+            # Convert beginning_padding and ending_padding arrays to JS array string
+            js_begin_padding_array = "[" + ", ".join(str(int(x)) for x in beginning_padding) + "]"
+            js_end_padding_array = "[" + ", ".join(str(int(x)) for x in ending_padding) + "]"
+
+            options = [
+                f"mode: '{webnn_mode}'",
+                f"value: {value}",
+            ]
+            # WebNN pad: builder.pad(x, beginningPadding, endingPadding, options)
+            js = f"""const {output_var} = builder.pad(
+        {input_var}, {js_begin_padding_array}, {js_end_padding_array},
+        {{
+            {', '.join(options)}
+        }}
+    );"""
+            return js
+
 
         # Register handlers
         op_handlers["Add"] = make_binary_handler("add")
@@ -1132,6 +1248,7 @@ def convert(
         op_handlers["MatMul"] = make_binary_handler("matmul")
         op_handlers["Mul"] = make_binary_handler("mul")
         op_handlers["QuantizeLinear"] = make_qdq_handler("quantizeLinear")
+        op_handlers["Pad"] = handle_pad
         op_handlers["Relu"] = make_unary_handler("relu")
         op_handlers["Reshape"] = handle_reshape
         op_handlers["Resize"] = handle_resize
