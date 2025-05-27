@@ -72,6 +72,23 @@ await webnnModel.build({deviceType});
 // Do inference with webnnModel.run()
 ```
 
+## Generate QDQ WebNN models
+This tool supports converting [QDQ (Quantize-Dequantize)](https://onnxruntime.ai/docs/performance/model-optimizations/quantization.html#onnx-quantization-representation-format) ONNX model to WebNN model. According WebNN quantizeLinear and dequantizeLinear [spec](https://www.w3.org/TR/webnn/#api-mlgraphbuilder-dequantizelinear), it may need to reshape the scale and zero point tensor according to the rank of input tensor and axis. To support this feature, please ensure the ONNX model has shape info for each output tensor by running [onnx-simplifier](https://github.com/daquexian/onnx-simplifier), e.g.
+```shell
+> pip3 install onnxsim
+> onnxsim ../sample_models/mobilenetv2-12-qdq-static.onnx ../sample_models/mobilenetv2-12-qdq-static-simplified.onnx
+```
+
+After that, generate WebNN model with the following command line
+```shell
+> python onnx2webnn.py -if ../sample_models/mobilenetv2-12-qdq-static-simplified.onnx -oj mobilenet_qdq/mobilenet_qdq.js
+```
+
+For NHWC model, use
+```shell
+> python onnx2webnn.py -if ../sample_models/mobilenetv2-12-qdq-static-simplified.onnx -oj mobilenet_qdq_nhwc/mobilenet_qdq_nhwc.js -nhwc
+```
+
 ## Dump JSON
 You can also dump the JSON file for debugging purpose.
 ```bash
