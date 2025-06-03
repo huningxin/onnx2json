@@ -253,11 +253,26 @@ def convert(
             dims_str = ', '.join(str(d) for d in dims)
             js_var_name = to_js_var_name(name)
             if isExternalData:
-                # Create a constant operand from weights_array_buffer
-                js_code = f"""const {js_var_name} = builder.constant(
+                # JS typed array requires the offset to be a multiple of BYTES_PER_ELEMENT
+                offset_expr = f"{offset}"
+                length_expr = f"{length}"
+                typed_array_bytes = f"{typed_array}.BYTES_PER_ELEMENT"
+                js_code = (
+                    f"""let {js_var_name}_buffer;
+    if ({offset_expr} % {typed_array_bytes} === 0) {{
+        {js_var_name}_buffer = new {typed_array}(weights_array_buffer, {offset_expr}, {length_expr} / {typed_array_bytes});
+    }} else {{
+        // Offset is not aligned, copy to a new Uint8Array and create typed array from it
+        const tmp = new Uint8Array(weights_array_buffer, {offset_expr}, {length_expr});
+        const buf = new Uint8Array({length_expr});
+        buf.set(tmp);
+        {js_var_name}_buffer = new {typed_array}(buf.buffer, 0, {length_expr} / {typed_array_bytes});
+    }}
+    const {js_var_name} = builder.constant(
         {{dataType: '{webnn_dtype}', shape: [{dims_str}]}},
-        new {typed_array}(weights_array_buffer, {offset}, {length} / {typed_array}.BYTES_PER_ELEMENT)
+        {js_var_name}_buffer
     );"""
+                )
             else:
                 # Create a constant operand from values
                 py_data = get_initializer_embedded_data(initializer)
@@ -1071,7 +1086,7 @@ def convert(
                     assert scale_shape == [] or len(scale_shape) == 1, f"DequantizeLinear scale shape must be scalar or 1D if not matching input rank, got {scale_shape}"
                     # Create new shape: all 1s, except axis
                     new_shape = [1] * len(input_shape)
-                    if scale_shape:  # not scalar
+                    if scale_shape and new_shape:  # not scalar
                         new_shape[axis] = scale_shape[0]
                     # Recreate constant for scale with new shape if not already created
                     # Encode shape into js var name
@@ -1139,6 +1154,7 @@ def convert(
     );"""
                 return js
             return handler
+
         # Handler for Pad -> WebNN pad
         def handle_pad(node):
             inputs = node.get("input", [])
@@ -1234,6 +1250,65 @@ def convert(
     );"""
             return js
 
+        # Handler for HardSigmoid -> WebNN hardSigmoid
+        def handle_hardsigmoid(node):
+            inputs = node.get("input", [])
+            outputs = node.get("output", [])
+            attrs = node.get("attribute", [])
+            input_var = to_js_var_name(inputs[0])
+            output_var = to_js_var_name(outputs[0])
+
+            # Default values for alpha and beta
+            alpha = 0.2
+            beta = 0.5
+            for attr in attrs:
+                if attr.get("name") == "alpha":
+                    alpha = float(attr.get("f", 0.2))
+                elif attr.get("name") == "beta":
+                    beta = float(attr.get("f", 0.5))
+
+            js = f"""const {output_var} = builder.hardSigmoid(
+        {input_var},
+        {{ alpha: {alpha}, beta: {beta} }}
+    );"""
+            return js
+
+        # Handler for Flatten -> WebNN reshape
+        def handle_flatten(node):
+            inputs = node.get("input", [])
+            outputs = node.get("output", [])
+            attrs = node.get("attribute", [])
+            input_var = to_js_var_name(inputs[0])
+            output_var = to_js_var_name(outputs[0])
+
+            # Default axis is 1
+            axis = 1
+            for attr in attrs:
+                if attr.get("name") == "axis":
+                    axis = int(attr.get("i", 1))
+                    break
+
+            input_shape = get_tensor_shape(inputs[0])
+            input_rank = len(input_shape)
+            # Handle negative axis
+            if axis < 0:
+                axis += input_rank
+            assert 0 <= axis <= input_rank, f"Flatten axis {axis} out of range for input rank {input_rank}"
+
+            # Compute new shape: [dim0*...*dim(axis-1), dim(axis)*...*dimN]
+            dim0 = 1
+            for i in range(axis):
+                dim0 *= input_shape[i]
+            dim1 = 1
+            for i in range(axis, input_rank):
+                dim1 *= input_shape[i]
+            new_shape = [dim0, dim1]
+
+            js = f"""const {output_var} = builder.reshape(
+        {input_var},
+        [{new_shape[0]}, {new_shape[1]}]
+    );"""
+            return js
 
         # Register handlers
         op_handlers["Add"] = make_binary_handler("add")
@@ -1243,8 +1318,11 @@ def convert(
         op_handlers["ConvTranspose"] = handle_convtranspose
         op_handlers["DequantizeLinear"] = make_qdq_handler("dequantizeLinear")
         op_handlers["Div"] = make_binary_handler("div")
+        op_handlers["Flatten"] = handle_flatten
         op_handlers["Gemm"] = handle_gemm
         op_handlers["GlobalAveragePool"] = handle_globalaveragepool
+        op_handlers["HardSigmoid"] = handle_hardsigmoid
+        op_handlers["HardSwish"] = make_unary_handler("hardSwish")
         op_handlers["MatMul"] = make_binary_handler("matmul")
         op_handlers["Mul"] = make_binary_handler("mul")
         op_handlers["QuantizeLinear"] = make_qdq_handler("quantizeLinear")
@@ -1268,9 +1346,8 @@ def convert(
                     js_code = handler(node)
                     js_lines.append("    " + js_code)
                 else:
-                    # Fallback: comment for unsupported ops
                     node_name = node.get("name", "")
-                    js_lines.append(f"// Unsupported op: {op_type} (node: {node_name})")
+                    raise RuntimeError(f"Unsupported op: {op_type} (node: {node_name})")
 
         # After handling all nodes, build the WebNN graph with all outputs
         js_lines.append("    // Build graph with output operands.")
