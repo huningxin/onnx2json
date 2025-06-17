@@ -792,77 +792,81 @@ def convert(
     );"""
             return js
 
-        # Handler for AveragePool -> WebNN averagePool2d
-        def handle_averagepool(node):
-            inputs = node.get("input", [])
-            outputs = node.get("output", [])
-            attrs = node.get("attribute", [])
-            attr_dict = {a["name"]: a for a in attrs}
-            input_vars = [to_js_var_name(i) for i in inputs]
-            output_var = to_js_var_name(outputs[0])
+        # Generic handler for AveragePool and MaxPool -> WebNN averagePool2d / maxPool2d
+        def make_pool_handler(webnn_op):
+            def handler(node):
+                inputs = node.get("input", [])
+                outputs = node.get("output", [])
+                attrs = node.get("attribute", [])
+                attr_dict = {a["name"]: a for a in attrs}
+                input_vars = [to_js_var_name(i) for i in inputs]
+                output_var = to_js_var_name(outputs[0])
 
-            # Handle strides
-            strides = attr_dict.get("strides", {}).get("ints", [1, 1])
-            assert len(strides) == 2, f"strides length must be 2, got {len(strides)}"
-            strides_js = f"[{', '.join(str(s) for s in strides)}]"
+                # Handle strides
+                strides = attr_dict.get("strides", {}).get("ints", [1, 1])
+                assert len(strides) == 2, f"strides length must be 2, got {len(strides)}"
+                strides_js = f"[{', '.join(str(s) for s in strides)}]"
 
-            # Handle pads
-            pads = attr_dict.get("pads", {}).get("ints", [0, 0, 0, 0])
-            assert len(pads) == 4, f"pads length must be 4, got {len(pads)}"
-            pads_webnn = [pads[0], pads[2], pads[1], pads[3]]
-            pads_js = f"[{', '.join(str(p) for p in pads_webnn)}]"
+                # Handle pads
+                pads = attr_dict.get("pads", {}).get("ints", [0, 0, 0, 0])
+                assert len(pads) == 4, f"pads length must be 4, got {len(pads)}"
+                pads_webnn = [pads[0], pads[2], pads[1], pads[3]]
+                pads_js = f"[{', '.join(str(p) for p in pads_webnn)}]"
 
-            # Handle kernel_shape
-            kernel_shape = attr_dict.get("kernel_shape", {}).get("ints", [0, 0])
-            assert len(kernel_shape) == 2, f"kernel_shape length must be 2, got {len(kernel_shape)}"
-            kernel_shape_js = f"[{', '.join(str(k) for k in kernel_shape)}]"
+                # Handle kernel_shape
+                kernel_shape = attr_dict.get("kernel_shape", {}).get("ints", [0, 0])
+                assert len(kernel_shape) == 2, f"kernel_shape length must be 2, got {len(kernel_shape)}"
+                kernel_shape_js = f"[{', '.join(str(k) for k in kernel_shape)}]"
 
-            # Handle dilations
-            dilations = attr_dict.get("dilations", {}).get("ints", [1, 1])
-            assert len(dilations) == 2, f"dilations length must be 2, got {len(dilations)}"
-            dilations_js = f"[{', '.join(str(d) for d in dilations)}]"
+                # Handle dilations
+                dilations = attr_dict.get("dilations", {}).get("ints", [1, 1])
+                assert len(dilations) == 2, f"dilations length must be 2, got {len(dilations)}"
+                dilations_js = f"[{', '.join(str(d) for d in dilations)}]"
 
-            # Handle ceil_mode
-            ceil_mode = int(attr_dict.get("ceil_mode", {}).get("i", 0))
-            if ceil_mode not in (0, 1):
-                raise ValueError(f"ceil_mode must be 0 or 1, got {ceil_mode}")
-            round_type_js = "'ceil'" if ceil_mode == 1 else "'floor'"
+                # Handle ceil_mode
+                ceil_mode = int(attr_dict.get("ceil_mode", {}).get("i", 0))
+                if ceil_mode not in (0, 1):
+                    raise ValueError(f"ceil_mode must be 0 or 1, got {ceil_mode}")
+                round_type_js = "'ceil'" if ceil_mode == 1 else "'floor'"
 
-            # Handle count_include_pad
-            count_include_pad = int(attr_dict.get("count_include_pad", {}).get("i", 0))
-            # WebNN doesn't support AveragePool with count_include_pad == 1, emulate it by pad + averagePool2d.
-            if count_include_pad == 1:
-                # Create pad options
-                beginning_padding = [0, 0, pads[0], pads[1]]
-                ending_padding = [0, 0, pads[2], pads[3]]
+                # Handle count_include_pad (only for averagePool)
+                count_include_pad = int(attr_dict.get("count_include_pad", {}).get("i", 0)) if webnn_op == "averagePool2d" else 0
+                # WebNN doesn't support AveragePool with count_include_pad == 1, emulate it by pad + averagePool2d.
+                if webnn_op == "averagePool2d" and count_include_pad == 1:
+                    # Create pad options
+                    input_shape = get_tensor_shape(inputs[0])
+                    input_rank = len(input_shape)
+                    beginning_padding = [0, 0, pads[0], pads[1]]
+                    ending_padding = [0, 0, pads[2], pads[3]]
+                    if nhwc:
+                        beginning_padding = [0, pads[0], pads[1], 0]
+                        ending_padding = [0, pads[2], pads[3], 0]
+
+                    js_begin_padding_array = "[" + ", ".join(str(x) for x in beginning_padding) + "]"
+                    js_end_padding_array = "[" + ", ".join(str(x) for x in ending_padding) + "]"
+
+                    # Use pad op instead of padding in averagePool2d options
+                    input_vars[0] = f"builder.pad({input_vars[0]}, {js_begin_padding_array}, {js_end_padding_array})"
+                    # Unset padding option, because we will use pad op instead
+                    pads_js = "undefined"  # No padding in averagePool2d options
+
+                options = [
+                    f"strides: {strides_js}",
+                    f"padding: {pads_js}",
+                    f"windowDimensions: {kernel_shape_js}",
+                    f"dilations: {dilations_js}",
+                    f"roundType: {round_type_js}"
+                ]
                 if nhwc:
-                    beginning_padding = [0, pads[0], pads[1], 0]
-                    ending_padding = [0, pads[2], pads[3], 0]
-
-                js_begin_padding_array = "[" + ", ".join(str(x) for x in beginning_padding) + "]"
-                js_end_padding_array = "[" + ", ".join(str(x) for x in ending_padding) + "]"
-
-                # Use pad op instead of padding in averagePool2d
-                input_vars[0] = f"builder.pad({input_vars[0]}, {js_begin_padding_array}, {js_end_padding_array})"
-                # Unset padding option, because we will use pad op instead
-                pads_js = "undefined"  # No padding in averagePool2d options
-
-            options = [
-                f"strides: {strides_js}",
-                f"padding: {pads_js}",
-                f"windowDimensions: {kernel_shape_js}",
-                f"dilations: {dilations_js}",
-                f"roundType: {round_type_js}"
-            ]
-            if nhwc:
-                options.append("layout: 'nhwc'")
-            js = f"""const {output_var} = builder.averagePool2d(
+                    options.append("layout: 'nhwc'")
+                js = f"""const {output_var} = builder.{webnn_op}(
         {input_vars[0]},
         {{
             {', '.join(options)}
         }}
     );"""
-            return js
+                return js
+            return handler
 
         # Handler for Reshape -> WebNN reshape
         def handle_reshape(node):
@@ -1414,7 +1418,7 @@ def convert(
 
         # Register handlers
         op_handlers["Add"] = make_binary_handler("add")
-        op_handlers["AveragePool"] = handle_averagepool
+        op_handlers["AveragePool"] = make_pool_handler("averagePool2d")
         op_handlers["Clip"] = handle_clip
         op_handlers["Concat"] = handle_concat
         op_handlers["Constant"] = handle_constant
@@ -1428,6 +1432,7 @@ def convert(
         op_handlers["HardSigmoid"] = handle_hardsigmoid
         op_handlers["HardSwish"] = make_unary_handler("hardSwish")
         op_handlers["MatMul"] = make_binary_handler("matmul")
+        op_handlers["MaxPool"] = make_pool_handler("maxPool2d")
         op_handlers["Mul"] = make_binary_handler("mul")
         op_handlers["QuantizeLinear"] = make_qdq_handler("quantizeLinear")
         op_handlers["Pad"] = handle_pad
