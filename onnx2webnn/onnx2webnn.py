@@ -1410,9 +1410,23 @@ def convert(
                     break
             axis = handle_negative_axis(axis, len(input_shape))
 
+            # Adjust axis for NHWC layout if needed
+            axis_comment = ""
+            if nhwc and len(input_shape) == 4:
+                # NCHW: 0-N, 1-C, 2-H, 3-W -> NHWC: 0-N, 1-H, 2-W, 3-C
+                orig_axis = axis
+                if axis == 1:
+                    axis = 3  # channel axis moves to last
+                elif axis == 2:
+                    axis = 1  # height axis moves to 1
+                elif axis == 3:
+                    axis = 2  # width axis moves to 2
+                if orig_axis != axis:
+                    axis_comment = f" // axis permuted from {orig_axis} to {axis} for NHWC"
+
             js = f"""const {output_var} = builder.concat(
         [{', '.join(input_vars)}],
-        {axis},
+        {axis},{axis_comment}
     );"""
             return js
 
