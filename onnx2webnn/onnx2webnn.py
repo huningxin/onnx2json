@@ -1234,10 +1234,10 @@ def convert(
             attrs = node.get("attribute", [])
             input_var = to_js_var_name(inputs[0])
             output_var = to_js_var_name(outputs[0])
-            input_tensor = get_tensor_shape(inputs[0])
-            if input_tensor is None:
+            input_shape = get_tensor_shape(inputs[0])
+            if input_shape is None:
                 raise AssertionError(f"Cannot get shape of input tensor '{inputs[0]}'.")
-            input_rank = len(input_tensor)
+            input_rank = len(input_shape)
             pads = None
             axes_py = None
 
@@ -1394,8 +1394,8 @@ def convert(
             attrs = node.get("attribute", [])
             input_vars = [to_js_var_name(i) for i in inputs]
             output_var = to_js_var_name(outputs[0])
-            input_tensor = get_tensor_shape(inputs[0])
-            if input_tensor is None:
+            input_shape = get_tensor_shape(inputs[0])
+            if input_shape is None:
                 raise AssertionError(f"Cannot get shape of input tensor '{inputs[0]}'.")
 
             # Default axis is 1
@@ -1404,7 +1404,7 @@ def convert(
                 if attr.get("name") == "axis":
                     axis = int(attr.get("i", 1))
                     break
-            axis = handle_negative_axis(axis, len(input_tensor))
+            axis = handle_negative_axis(axis, len(input_shape))
 
             js = f"""const {output_var} = builder.concat(
         [{', '.join(input_vars)}],
