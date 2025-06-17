@@ -1234,10 +1234,10 @@ def convert(
             attrs = node.get("attribute", [])
             input_var = to_js_var_name(inputs[0])
             output_var = to_js_var_name(outputs[0])
-            input_tensor = get_tensor_shape(inputs[0])
-            if input_tensor is None:
+            input_shape = get_tensor_shape(inputs[0])
+            if input_shape is None:
                 raise AssertionError(f"Cannot get shape of input tensor '{inputs[0]}'.")
-            input_rank = len(input_tensor)
+            input_rank = len(input_shape)
             pads = None
             axes_py = None
 
@@ -1370,9 +1370,7 @@ def convert(
             input_shape = get_tensor_shape(inputs[0])
             input_rank = len(input_shape)
             # Handle negative axis
-            if axis < 0:
-                axis += input_rank
-            assert 0 <= axis <= input_rank, f"Flatten axis {axis} out of range for input rank {input_rank}"
+            axis = handle_negative_axis(axis, input_rank)
 
             # Compute new shape: [dim0*...*dim(axis-1), dim(axis)*...*dimN]
             dim0 = 1
@@ -1389,10 +1387,36 @@ def convert(
     );"""
             return js
 
+        # Handler for Concat -> WebNN concat
+        def handle_concat(node):
+            inputs = node.get("input", [])
+            outputs = node.get("output", [])
+            attrs = node.get("attribute", [])
+            input_vars = [to_js_var_name(i) for i in inputs]
+            output_var = to_js_var_name(outputs[0])
+            input_shape = get_tensor_shape(inputs[0])
+            if input_shape is None:
+                raise AssertionError(f"Cannot get shape of input tensor '{inputs[0]}'.")
+
+            # Default axis is 1
+            axis = 1
+            for attr in attrs:
+                if attr.get("name") == "axis":
+                    axis = int(attr.get("i", 1))
+                    break
+            axis = handle_negative_axis(axis, len(input_shape))
+
+            js = f"""const {output_var} = builder.concat(
+        [{', '.join(input_vars)}],
+        {axis},
+    );"""
+            return js
+
         # Register handlers
         op_handlers["Add"] = make_binary_handler("add")
         op_handlers["AveragePool"] = handle_averagepool
         op_handlers["Clip"] = handle_clip
+        op_handlers["Concat"] = handle_concat
         op_handlers["Constant"] = handle_constant
         op_handlers["Conv"] = handle_conv
         op_handlers["ConvTranspose"] = handle_convtranspose
