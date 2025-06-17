@@ -1526,9 +1526,25 @@ def convert(
     </select>
     <label for="numRuns">#Runs:</label>
     <input type="number" id="numRuns" value="1" min="1" style="width: 4em;">
+    <div id="layout-info" style="margin-top:1em;color:#444;"></div>
     <pre id="output"></pre>
     <script type="module">
         import {{ {class_name} }} from './{os.path.basename(output_js_path)}';
+
+        // Display preferred input layout.
+        async function updatePreferredLayout() {{
+            try {{
+                const deviceType = document.getElementById('deviceType').value || 'gpu';
+                const context = await navigator.ml.createContext({{ deviceType }});
+                const layout = context.opSupportLimits().preferredInputLayout;
+                document.getElementById('layout-info').textContent = 'WebNN context preferred input layout: ' + layout;
+            }} catch (e) {{
+                document.getElementById('layout-info').textContent = 'Failed to get preferred input layout: ' + e;
+            }}
+        }}
+
+        window.addEventListener('DOMContentLoaded', updatePreferredLayout);
+        document.getElementById('deviceType').addEventListener('change', updatePreferredLayout);
 
         document.getElementById('run-btn').onclick = async () => {{
             const output = document.getElementById('output');
