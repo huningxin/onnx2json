@@ -1440,6 +1440,7 @@ def convert(
         op_handlers["ConvTranspose"] = handle_convtranspose
         op_handlers["DequantizeLinear"] = make_qdq_handler("dequantizeLinear")
         op_handlers["Div"] = make_binary_handler("div")
+        op_handlers["Dropout"] = make_unary_handler("identity")
         op_handlers["Flatten"] = handle_flatten
         op_handlers["Gemm"] = handle_gemm
         op_handlers["GlobalAveragePool"] = handle_globalaveragepool
