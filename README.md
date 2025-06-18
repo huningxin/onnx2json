@@ -89,6 +89,18 @@ For NHWC model, use
 > python onnx2webnn.py -if ../sample_models/mobilenetv2-12-qdq-static-simplified.onnx -oj mobilenet_qdq_nhwc/mobilenet_qdq_nhwc.js -nhwc
 ```
 
+## Generate model with shape info
+Some models contain nodes that need to know the shape info before conversion. For example squeezenet1.1-7.onnx, it contains `Concat` operator with axis -1. To handle it, please ensure the ONNX model has shape info for each output tensor by running [onnx-simplifier](https://github.com/daquexian/onnx-simplifier), e.g.
+```shell
+> pip3 install onnxsim
+> onnxsim ../sample_models/squeezenet1.1-7.onnx ../sample_models/squeezenet1.1-7-simplified.onnx
+```
+
+After that, generate WebNN model from the simplified ONNX model with the following command line
+```shell
+> python onnx2webnn.py -if ../sample_models/squeezenet1.1-7-simplified.onnx -oj squeezenet/squeezenet.js
+```
+
 ## Dump JSON
 You can also dump the JSON file for debugging purpose.
 ```bash
