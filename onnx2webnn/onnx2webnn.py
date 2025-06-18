@@ -288,8 +288,12 @@ def convert(
         # Generate all the graph input operands and tensors
         js_lines.append("    // Create graph input operands and tensors.")
         graph_inputs = onnx_json['graph'].get('input', [])
+        initializer_names = {init['name'] for init in initializers}
         for input_info in graph_inputs:
             name = input_info['name']
+            # Skip if input is also an initializer
+            if name in initializer_names:
+                continue
             dims = input_info.get('type', {}).get('tensorType', {}).get('shape', {}).get('dim', [])
             dims_str = ', '.join(str(d.get('dimValue', 1)) for d in dims)
             elem_type = input_info.get('type', {}).get('tensorType', {}).get('elemType', 1)
@@ -855,7 +859,7 @@ def convert(
                     f"padding: {pads_js}",
                     f"windowDimensions: {kernel_shape_js}",
                     f"dilations: {dilations_js}",
-                    f"roundType: {round_type_js}"
+                    f"roundingType: {round_type_js}"
                 ]
                 if nhwc:
                     options.append("layout: 'nhwc'")
@@ -881,6 +885,8 @@ def convert(
 
             # Use get_initializer_array to get shape array as Python list
             shape_py = get_initializer_array(shape_name, expected_dtype=7)
+            # Replace all 0 values in shape_py with 1
+            shape_py = [1 if int(x) == 0 else int(x) for x in shape_py]
             # Convert shape array to JS array string
             js_shape_array = "[" + ", ".join(str(int(x)) for x in shape_py) + "]"
             # Handle -1 for dynamic shape
