@@ -9,6 +9,7 @@ from typing import Optional
 from argparse import ArgumentParser
 import base64
 import numpy as np
+import shutil
 
 class Color:
     BLACK          = '\033[30m'
@@ -43,6 +44,7 @@ def convert(
     nhwc: Optional[bool] = False,
     dump_json: Optional[bool] = False,
     json_indent: Optional[int] = 2,
+    imagenet: Optional[bool] = False
 ):
     """
     Parameters
@@ -72,6 +74,10 @@ def convert(
     json_indent: Optional[int]
         Number of indentations in JSON.\n\
         Default: 2
+
+    imagenet: Optional[bool]
+        Generate code in index.html for testing imagenet\n\
+        Default: false
 
     Returns
     -------
@@ -1117,8 +1123,7 @@ def convert(
             def handler(node):
                 inputs = node.get("input", [])
                 outputs = node.get("output", [])
-                a_var_name = to_js_var_name(inputs[0])
-                # b might be a constant
+                a_var_name = try_create_constant(inputs[0])
                 b_var_name = try_create_constant(inputs[1])
                 output_var = to_js_var_name(outputs[0])
                 js = f"""const {output_var} = builder.{op}({a_var_name}, {b_var_name});"""
@@ -1567,6 +1572,24 @@ def convert(
         with open(output_js_path, "w", encoding="utf-8") as f:
             f.write('\n\n'.join(js_lines))
 
+        if imagenet:
+            # Try to copy labels1000.txt from the ONNX model's folder to the JS output folder
+            onnx_dir = os.path.dirname(input_onnx_file_path)
+            js_dir = os.path.dirname(output_js_path)
+            src_labels = os.path.join(onnx_dir, "labels1000.txt")
+            dst_labels = os.path.join(js_dir, "labels1000.txt")
+            if os.path.isfile(src_labels):
+                try:
+                    shutil.copyfile(src_labels, dst_labels)
+                    print(
+                        f'{Color.GREEN}INFO:{Color.RESET} '+
+                        f"Copied {src_labels} to {dst_labels}"
+                    )
+                except Exception as e:
+                    print(f"Warning: Could not copy labels1000.txt: {e}")
+            else:
+                print(f"Warning: labels1000.txt not found in {onnx_dir}")
+
         # Generate index.html to test the model
         html_path = os.path.join(os.path.dirname(output_js_path), "index.html")
         html_code = f"""<!DOCTYPE html>
@@ -1577,6 +1600,7 @@ def convert(
 </head>
 <body>
     <h1>Test {output_js_path}</h1>
+    {('<div id="imgblock"><input type="file" id="imgfile" accept="image/*"><canvas id="imgcanvas" style="display:none"></canvas></div>') if imagenet else ""}
     <button id="run-btn">Build & Run Model</button>
     <label for="deviceType">Device:</label>
     <select id="deviceType">
@@ -1586,56 +1610,63 @@ def convert(
     </select>
     <label for="numRuns">#Runs:</label>
     <input type="number" id="numRuns" value="1" min="1" style="width: 4em;">
-    <div id="layout-info" style="margin-top:1em;color:#444;"></div>
     <pre id="output"></pre>
+    <div id="layout-info" style="margin-top:1em;color:#444;"></div>
     <script type="module">
         import {{ {class_name} }} from './{os.path.basename(output_js_path)}';
 
-        // Display preferred input layout.
-        async function updatePreferredLayout() {{
-            try {{
-                const deviceType = document.getElementById('deviceType').value || 'gpu';
-                const context = await navigator.ml.createContext({{ deviceType }});
-                const layout = context.opSupportLimits().preferredInputLayout;
-                document.getElementById('layout-info').textContent = 'WebNN context preferred input layout: ' + layout;
-            }} catch (e) {{
-                document.getElementById('layout-info').textContent = 'Failed to get preferred input layout: ' + e;
-            }}
-        }}
+        {"// Convert image file to Float32Array in NCHW and display image\n"
+         "async function getImageInputData(inputShape) {\n"
+         "    return new Promise((resolve, reject) => {\n"
+         "        const fileInput = document.getElementById('imgfile');\n"
+         "        if (!fileInput.files.length) {\n"
+         "            reject('No image selected.');\n"
+         "            return;\n"
+         "        }\n"
+         "        const file = fileInput.files[0];\n"
+         "        const reader = new FileReader();\n"
+         "        reader.onload = function(e) {\n"
+         "            const img = new Image();\n"
+         "            img.onload = function() {\n"
+         "                const [n, c, h, w] = inputShape.length === 4 ? inputShape : [1, 3, 224, 224];\n"
+         "                const canvas = document.getElementById('imgcanvas');\n"
+         "                canvas.width = w;\n"
+         "                canvas.height = h;\n"
+         "                const ctx = canvas.getContext('2d');\n"
+         "                ctx.drawImage(img, 0, 0, w, h);\n"
+         "                canvas.style.display = '';\n"
+         "                const imgData = ctx.getImageData(0, 0, w, h).data;\n"
+         "                let arr = new Float32Array(n * c * h * w);\n"
+         "                const mean = [0.485, 0.456, 0.406];\n"
+         "                const std = [0.229, 0.224, 0.225];\n"
+         "                for (let ch = 0; ch < c; ++ch) {\n"
+         "                    for (let y = 0; y < h; ++y) {\n"
+         "                        for (let x = 0; x < w; ++x) {\n"
+         "                            let v = imgData[(y * w + x) * 4 + ch] / 255.0;\n"
+         "                            v = (v - mean[ch]) / std[ch];\n"
+         "                            arr[ch * h * w + y * w + x] = v;\n"
+         "                        }\n"
+         "                    }\n"
+         "                }\n"
+         "                resolve(arr);\n"
+         "            };\n"
+         "            img.onerror = reject;\n"
+         "            img.src = e.target.result;\n"
+         "        };\n"
+         "        reader.onerror = reject;\n"
+         "        reader.readAsDataURL(file);\n"
+         "    });\n"
+         "}\n"
+         if imagenet else ""}
 
-        window.addEventListener('DOMContentLoaded', updatePreferredLayout);
-        document.getElementById('deviceType').addEventListener('change', updatePreferredLayout);
-
-        document.getElementById('run-btn').onclick = async () => {{
-            const output = document.getElementById('output');
-            output.textContent = 'Building model...\\n';
-            try {{
-                const deviceType = document.getElementById('deviceType').value || 'gpu';
-                const t0 = performance.now();
-                const model = new {class_name}();
-                await model.build({{ deviceType: deviceType }});
-                const t1 = performance.now();
-                output.textContent += `Model built successfully. Build latency: ${{(t1 - t0).toFixed(2)}} ms\\n`;
-
-                // Output input tensor info
-                output.textContent += '\\nInput tensors:\\n';
-                for (const name in model.inputTensors_) {{
-                    const tensor = model.inputTensors_[name];
-                    output.textContent += `  ${{name}}: shape=[${{tensor.shape}}], dataType=${{tensor.dataType}}\\n`;
-                }}
-
-                // Output output tensor info
-                output.textContent += '\\nOutput tensors:\\n';
-                for (const name in model.outputTensors_) {{
-                    const tensor = model.outputTensors_[name];
-                    output.textContent += `  ${{name}}: shape=[${{tensor.shape}}], dataType=${{tensor.dataType}}\\n`;
-                }}
-                output.textContent += '\\n';
-
-                // Prepare dummy input data for testing (random values)
-                const inputs = {{}};
-                for (const name in model.inputTensors_) {{
-                    const tensor = model.inputTensors_[name];
+        async function getInputs(model) {{
+            const inputs = {{}};
+            for (const name in model.inputTensors_) {{
+                const tensor = model.inputTensors_[name];
+                if ({'true' if imagenet else 'false'}) {{
+                    // Use image input
+                    inputs[name] = await getImageInputData(tensor.shape);
+                }} else {{
                     let TypedArrayCtor = Float32Array;
                     switch (tensor.dataType) {{
                         case 'float32': TypedArrayCtor = Float32Array; break;
@@ -1656,19 +1687,80 @@ def convert(
                     if (TypedArrayCtor === Float32Array || TypedArrayCtor === Float64Array) {{
                         for (let i = 0; i < size; ++i) arr[i] = Math.random();
                     }} else if (TypedArrayCtor.BYTES_PER_ELEMENT === 8) {{
-                        // BigInt64Array/BigUint64Array
                         for (let i = 0; i < size; ++i) arr[i] = BigInt(Math.floor(Math.random() * 100));
                     }} else {{
                         for (let i = 0; i < size; ++i) arr[i] = Math.floor(Math.random() * 100);
                     }}
                     inputs[name] = arr;
                 }}
+            }}
+            return inputs;
+        }}
+
+        async function showTop5(results) {{
+            // Fetch labels if not already loaded
+            if (!window.imagenetLabels) {{
+                const resp = await fetch('labels1000.txt');
+                window.imagenetLabels = (await resp.text()).split('\\n').map(s => s.trim()).filter(s => s.length > 0);
+            }}
+            const labels = window.imagenetLabels;
+            // Assume single output
+            const output = Object.values(results)[0];
+            let arr = Array.from(output);
+            // Always apply softmax
+            function softmax(arr) {{
+                const max = Math.max(...arr);
+                const exps = arr.map(x => Math.exp(x - max));
+                const sum = exps.reduce((a, b) => a + b, 0);
+                return exps.map(e => e / sum);
+            }}
+            arr = softmax(arr);
+            let top5 = arr.map((v, i) => [v, i])
+                .sort((a, b) => b[0] - a[0])
+                .slice(0, 5);
+            let msg = "Top 5 results:\\n";
+            for (const [score, idx] of top5) {{
+                const label = labels && labels[idx] ? labels[idx] : `#${{idx}}`;
+                msg += `  ${{label}}: ${{(score * 100).toFixed(2)}}%\\n`;
+            }}
+            document.getElementById('output').textContent += msg;
+        }}
+
+        async function runModel() {{
+            const output = document.getElementById('output');
+            output.textContent = 'Building model...\\n';
+            try {{
+                const deviceType = document.getElementById('deviceType').value || 'gpu';
+                const t0 = performance.now();
+                const model = new {class_name}();
+                await model.build({{ deviceType: deviceType }});
+                const t1 = performance.now();
+                output.textContent += `Model built successfully. Build latency: ${{(t1 - t0).toFixed(2)}} ms\\n`;
+
+                // Output input tensor info
+                {"if (!" + str(imagenet).lower() + ") {" if imagenet else ""}
+                output.textContent += '\\nInput tensors:\\n';
+                for (const name in model.inputTensors_) {{
+                    const tensor = model.inputTensors_[name];
+                    output.textContent += `  ${{name}}: shape=[${{tensor.shape}}], dataType=${{tensor.dataType}}\\n`;
+                }}
+                output.textContent += '\\n';
+
+                // Output output tensor info
+                output.textContent += '\\nOutput tensors:\\n';
+                for (const name in model.outputTensors_) {{
+                    const tensor = model.outputTensors_[name];
+                    output.textContent += `  ${{name}}: shape=[${{tensor.shape}}], dataType=${{tensor.dataType}}\\n`;
+                }}
+                output.textContent += '\\n';
+                {"}" if imagenet else ""}
+
+                // Prepare input data
+                const inputs = await getInputs(model);
 
                 output.textContent += 'Running inference...\\n';
-                // Get number of runs from input
                 let numRuns = parseInt(document.getElementById('numRuns').value) || 1;
                 if (numRuns < 1) numRuns = 1;
-                // Time model.run and print median inference latency
                 const latencies = [];
                 let results = null;
                 for (let i = 0; i < numRuns; ++i) {{
@@ -1681,11 +1773,16 @@ def convert(
                 const median = latencies[Math.floor(latencies.length / 2)];
                 output.textContent += `Median inference latency (${{numRuns}} runs): ${{median.toFixed(2)}} ms\\n`;
                 output.textContent += '\\n';
-                output.textContent += 'Inference results:\\n' + JSON.stringify(results, null, 2);
+                {"await showTop5(results);" if imagenet else "output.textContent += 'Inference results:\\n' + JSON.stringify(results, null, 2) + '\\n';"}
+
             }} catch (e) {{
                 output.textContent += 'Error: ' + e;
             }}
-        }};
+        }}
+
+        window.addEventListener('DOMContentLoaded', () => {{
+            document.getElementById('run-btn').onclick = runModel;
+        }});
     </script>
 </body>
 </html>
@@ -1731,6 +1828,13 @@ def main():
         default=2,
         help='Number of indentations in JSON. (default=2)'
     )
+    parser.add_argument(
+        '-imagenet',
+        '--imagenet',
+        action='store_true',
+        help='Test imagenet model in the generated index.html'
+    )
+
     args = parser.parse_args()
 
     input_onnx_file_path = args.input_onnx_file_path
@@ -1738,17 +1842,16 @@ def main():
     nhwc = args.nhwc
     dump_json = args.dump_json
     json_indent = args.json_indent
-
-    # Convert onnx model to JSON
-    onnx_graph = onnx.load(input_onnx_file_path)
+    imagenet = args.imagenet
 
     onnx_json = convert(
-        input_onnx_file_path=None,
-        onnx_graph=onnx_graph,
+        input_onnx_file_path=input_onnx_file_path,
+        onnx_graph=None,
         output_js_path=output_js_path,
         nhwc=nhwc,
         dump_json=dump_json,
         json_indent=json_indent,
+        imagenet=imagenet
     )
 
 
