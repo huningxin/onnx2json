@@ -10,7 +10,7 @@ $ pip install -U onnx protobuf numpy
 ```
 ## CLI Usage
 ```
-usage: onnx2webnn.py [-h] -if INPUT_ONNX_FILE_PATH -oj OUTPUT_JS_PATH [-nhwc] [-json] [-i JSON_INDENT]
+usage: onnx2webnn.py [-h] -if INPUT_ONNX_FILE_PATH -oj OUTPUT_JS_PATH [-nhwc] [-json] [-i JSON_INDENT] [-imagenet]
 
 options:
   -h, --help            show this help message and exit
@@ -22,6 +22,8 @@ options:
   -json, --dump_json    Dump the JSON representation of ONNX model
   -i JSON_INDENT, --json_indent JSON_INDENT
                         Number of indentations in JSON. (default=2)
+  -imagenet, --imagenet
+                        Test imagenet model in the generated index.html
 ```
 
 ## Generate WebNN JavaScript model
@@ -100,6 +102,16 @@ After that, generate WebNN model from the simplified ONNX model with the followi
 ```shell
 > python onnx2webnn.py -if ../sample_models/squeezenet1.1-7-simplified.onnx -oj squeezenet/squeezenet.js
 ```
+
+## Test image classification models
+Models trained by ImageNet for image classification, such as MobileNet, can be tested with index.html generated with `--imagenet` switch. This is uesful to verify the correctness of generated WebNN models.
+
+For example
+```shell
+$ python onnx2webnn.py -if ../sample_models/mobilenetv2-12-static.onnx -oj mobilenet/mobilenet.js -imagenet
+```
+
+It will generate image pre-processing and result post-processing code in index.html. After launching index.html, you can upload an image as input. After running the model, the top 5 classification results will be displayed.
 
 ## Dump JSON
 You can also dump the JSON file for debugging purpose.
