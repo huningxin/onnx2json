@@ -231,59 +231,7 @@ def convert(
             else:
                 return []
 
-        # Generate all the constant operands
-        js_lines.append("    // Create graph constant operands.")
         initializers = onnx_json['graph'].get('initializer', [])
-        for initializer in initializers:
-            name = initializer['name']
-            dims = initializer.get('dims', [])
-            data_type = initializer.get('dataType', None)
-            offset = None
-            length = None
-            isExternalData = False
-            if "externalData" in initializer:
-                isExternalData = True
-                for entry in initializer["externalData"]:
-                    if entry["key"] == "offset":
-                        offset = int(entry["value"])
-                    elif entry["key"] == "length":
-                        length = int(entry["value"])
-            webnn_dtype = webnn_type_map.get(data_type, 'float32')
-            typed_array = typed_array_map.get(data_type, 'Float32Array')
-            dims_str = ', '.join(str(d) for d in dims)
-            js_var_name = to_js_var_name(name)
-            if isExternalData:
-                # JS typed array requires the offset to be a multiple of BYTES_PER_ELEMENT
-                offset_expr = f"{offset}"
-                length_expr = f"{length}"
-                typed_array_bytes = f"{typed_array}.BYTES_PER_ELEMENT"
-                js_code = (
-                    f"""let {js_var_name}_buffer;
-    if ({offset_expr} % {typed_array_bytes} === 0) {{
-        {js_var_name}_buffer = new {typed_array}(weights_array_buffer, {offset_expr}, {length_expr} / {typed_array_bytes});
-    }} else {{
-        // Offset is not aligned, copy to a new Uint8Array and create typed array from it
-        const tmp = new Uint8Array(weights_array_buffer, {offset_expr}, {length_expr});
-        const buf = new Uint8Array({length_expr});
-        buf.set(tmp);
-        {js_var_name}_buffer = new {typed_array}(buf.buffer, 0, {length_expr} / {typed_array_bytes});
-    }}
-    const {js_var_name} = builder.constant(
-        {{dataType: '{webnn_dtype}', shape: [{dims_str}]}},
-        {js_var_name}_buffer
-    );"""
-                )
-            else:
-                # Create a constant operand from values
-                py_data = get_initializer_embedded_data(initializer)
-                js_data = "[" + ", ".join(str(x) for x in py_data) + "]"
-                if webnn_dtype == "int64":
-                    js_data = "[" + ", ".join(str(x + "n") for x in py_data) + "]"
-                js_code = f"""const {js_var_name} = builder.constant(
-        {{dataType: '{webnn_dtype}', shape: [{dims_str}]}},
-        new {typed_array}({js_data})
-    );"""
-            js_lines.append("    " + js_code)
 
         # Generate all the graph input operands and tensors
         js_lines.append("    // Create graph input operands and tensors.")
@@ -359,45 +307,101 @@ def convert(
             13: np.uint64,   # UINT64
         }
 
-        # Helper to transpose weights in external weights file
-        def transpose_external_weights(filter_name, permutation):
-            filter_init = next((init for init in initializers if init['name'] == filter_name), None)
-            assert filter_init is not None and "externalData" in filter_init, f"Filter {filter_name} must be externalData for NHWC conversion"
-            data_type = filter_init.get("dataType", 1)
-            offset = None
-            length = None
-            for entry in filter_init["externalData"]:
-                if entry["key"] == "offset":
-                    offset = int(entry["value"])
-                elif entry["key"] == "length":
-                    length = int(entry["value"])
-            assert offset is not None and length is not None, "Filter externalData missing offset/length"
-            dims = filter_init.get("dims", [])
+        constant_var_cache = {}
+        # Helper to try to create a WebNN constant from an initializer name, with optional permutation, new_shape, and caching
+        def try_create_constant(initializer_name, permutation=None, new_shape=None):
+            """
+            Given an initializer name, create the corresponding WebNN constant JS code if not created, otherwise return the cached JS variable name of the crated constant.
+            If permutation is provided, transpose the data before creating the constant.
+            If new_shape is provided, use it as the shape for the constant.
+            Returns the JS variable name for the constant. If not an initializer, just returns the JS variable name.
+            """
+            cache_key = (initializer_name, tuple(permutation) if permutation is not None else None, tuple(new_shape) if new_shape is not None else None)
+            js_var_name = to_js_var_name(initializer_name)
+            if cache_key in constant_var_cache:
+                return constant_var_cache[cache_key]
+
+            initializer = next((init for init in initializers if init['name'] == initializer_name), None)
+            if initializer is None:
+                # Not an initializer, just return the JS variable name
+                return js_var_name
+
+            dims = list(new_shape) if new_shape is not None else initializer.get('dims', [])
             dims = [int(d) for d in dims]  # Ensure all dims are int
-            assert len(dims) == len(permutation), "Permutation must match filter dimensions"
-
-            np_dtype = onnx_dtype_to_np.get(data_type, np.float32)
-
-            # Read, transpose, and write back, the weights_array_buffer will contain the transposed weights
-            with open(external_data_file_path, "r+b") as f:
-                f.seek(offset)
-                arr = np.frombuffer(f.read(length), dtype=np_dtype).reshape(tuple(dims))
-                arr_transposed = np.transpose(arr, permutation)
-                f.seek(offset)
-                f.write(arr_transposed.astype(np_dtype).tobytes())
-
-            # Generate the JS code to re-create a constant from the transposed weights and return the new constant name
-            permuted_shape = [dims[i] for i in permutation]
+            if permutation != None:
+                assert len(dims) == len(permutation), "Permutation must match filter dimensions"
+            data_type = initializer.get('dataType', 1)
             webnn_dtype = webnn_type_map.get(data_type, 'float32')
+            if permutation is not None:
+                js_var_name += "_perm" + "".join(str(i) for i in permutation)
+            if new_shape is not None:
+                js_var_name += "_reshaped_" + "_".join(str(x) for x in new_shape)
             typed_array = typed_array_map.get(data_type, 'Float32Array')
-            dims_str = ', '.join(str(d) for d in permuted_shape)
-            filter_var_name = to_js_var_name(filter_name)+'_transposed'
-            js_lines.append("    // Re-create constant operand from transposed weights.")
-            js_lines.append(f"""    const {filter_var_name} = builder.constant(
+
+            if "externalData" in initializer:
+                # External data handling: load, transpose with numpy, and write back
+                offset = 0
+                length = 0
+                location = None
+                for entry in initializer["externalData"]:
+                    if entry["key"] == "offset":
+                        offset = int(entry["value"])
+                    elif entry["key"] == "length":
+                        length = int(entry["value"])
+                    elif entry["key"] == "location":
+                        location = entry["value"]
+                # Read the external data file and transpose if needed
+                if permutation is not None:
+                    # Read, transpose, and write back, the weights_array_buffer will contain the transposed weights
+                    np_dtype = onnx_dtype_to_np.get(data_type, np.float32)
+                    with open(location, "r+b") as f:
+                        f.seek(offset)
+                        arr = np.frombuffer(f.read(length), dtype=np_dtype).reshape(tuple(dims))
+                        arr_transposed = np.transpose(arr, permutation)
+                        f.seek(offset)
+                        f.write(arr_transposed.astype(np_dtype).tobytes())
+                    
+                    dims_perm = [dims[p] for p in permutation]
+                    dims_str = ', '.join(str(d) for d in dims_perm)
+                else:
+                    dims_str = ', '.join(str(d) for d in dims)
+                typed_array_bytes = f"{typed_array}.BYTES_PER_ELEMENT"
+                base_buffer_var = f"{js_var_name}_buffer"
+                js_code = (
+                    f"""let {base_buffer_var} = new {typed_array}(weights_array_buffer, {offset}, {length} / {typed_array_bytes});
+    const {js_var_name} = builder.constant(
         {{dataType: '{webnn_dtype}', shape: [{dims_str}]}},
-        new {typed_array}(weights_array_buffer, {offset}, {length} / {typed_array}.BYTES_PER_ELEMENT)
-    );""")
-            return filter_var_name
+        {base_buffer_var}
+    );"""
+                )
+            else:
+                # Embedded data
+                py_data = get_initializer_embedded_data(initializer)
+                if permutation is not None:
+                    np_dtype = onnx_dtype_to_np.get(data_type, np.float32)
+                    arr = np.array(py_data, dtype=np_dtype)
+                    arr = arr.reshape(dims)
+                    arr = np.transpose(arr, permutation)
+                    arr = arr.flatten()
+                    if webnn_dtype == "int64":
+                        js_data = "[" + ", ".join(str(x) + "n" for x in arr) + "]"
+                    else:
+                        js_data = "[" + ", ".join(str(x) for x in arr) + "]"
+                    dims_perm = [dims[p] for p in permutation]
+                    dims_str = ', '.join(str(d) for d in dims_perm)
+                else:
+                    if webnn_dtype == "int64":
+                        js_data = "[" + ", ".join(str(x) + "n" for x in py_data) + "]"
+                    else:
+                        js_data = "[" + ", ".join(str(x) for x in py_data) + "]"
+                    dims_str = ', '.join(str(d) for d in dims)
+                js_code = f"""const {js_var_name} = builder.constant(
+        {{dataType: '{webnn_dtype}', shape: [{dims_str}]}},
+        new {typed_array}({js_data})
+    );"""
+            js_lines.append("    " + js_code)
+            constant_var_cache[cache_key] = js_var_name
+            return js_var_name
 
         # Helper to fetch a tensor shape from valueInfo in the ONNX JSON.
         # ONNX Simplifier will do shape inference and add value info for each output tensor.
@@ -532,7 +536,9 @@ def convert(
             # NHWC filter transpose: OIHW -> OHWI (normal) or OIHW -> IHWO (depthwise)
             filter_layout = None
             dq_input = None
-            if nhwc:
+            if not nhwc:
+                filter_var_name = try_create_constant(filter_name)
+            else:
                 filter_name_for_transpose = None
                 # If filter_name is not an initializer, try to find the DequantizeLinear input
                 filter_is_initializer = any(init['name'] == filter_name for init in initializers)
@@ -545,11 +551,11 @@ def convert(
 
                 if is_depthwise:
                     # Depthwise: OIHW -> IHWO
-                    filter_var_name = transpose_external_weights(filter_name_for_transpose, (1, 2, 3, 0))
+                    filter_var_name = try_create_constant(filter_name_for_transpose, (1, 2, 3, 0))
                     filter_layout = "'ihwo'"
                 else:
                     # Regular: OIHW -> OHWI
-                    filter_var_name = transpose_external_weights(filter_name_for_transpose, (0, 2, 3, 1))
+                    filter_var_name = try_create_constant(filter_name_for_transpose, (0, 2, 3, 1))
                     filter_layout = "'ohwi'"
 
                 # If filter_name was not an initializer, recreate WebNN dequantizeLinear op for the filter_var_name
@@ -565,8 +571,13 @@ def convert(
                     js_lines.append(f"    {dq_js}")
                     filter_var_name = to_js_var_name(dq_node["output"][0])
 
+            bias_var_name = 'undefined'
+            if  len(inputs) > 2:
+                bias_name = inputs[2]
+                bias_var_name = try_create_constant(bias_name)
+
             options = [
-                f"bias: {input_vars[2] if len(input_vars) > 2 else 'undefined'}",
+                f"bias: {bias_var_name}",
                 f"strides: {strides_js}",
                 f"padding: {pads_js}",
                 f"dilations: {dilations_js}",
@@ -636,11 +647,18 @@ def convert(
             filter_var_name = input_vars[1]
             filter_layout = None
             if nhwc:
-                filter_var_name = transpose_external_weights(filter_name, (1, 2, 3, 0))
+                filter_var_name = try_create_constant(filter_name, (1, 2, 3, 0))
                 filter_layout = "'ohwi'"
+            else:
+                filter_var_name = try_create_constant(filter_name)
+
+            bias_var_name = 'undefined'
+            if  len(inputs) > 2:
+                bias_name = inputs[2]
+                bias_var_name = try_create_constant(bias_name)
 
             options = [
-                f"bias: {input_vars[2] if len(input_vars) > 2 else 'undefined'}",
+                f"bias: {bias_var_name}",
                 f"strides: {strides_js}",
                 f"padding: {pads_js}",
                 f"dilations: {dilations_js}",
@@ -661,17 +679,18 @@ def convert(
             return js
 
         # Helper to extract array from initializer (externalData or embedded)
-        def get_initializer_array(name, expected_dtype=None, expected_len=None):
+        def get_initializer_values(name, expected_dtype=None, expected_len=None):
             init = next((init for init in initializers if init['name'] == name), None)
             assert init is not None, f"'{name}' must be an initializer"
             data_type = init.get("dataType", 1)
 
-            if expected_dtype is not None:
-                # Ensure expected_dtype can be a single type or a tuple of types
-                if not isinstance(expected_dtype, (tuple, list)):
-                    expected_dtype = (expected_dtype,)
-                if data_type not in expected_dtype:
-                    raise AssertionError(f"Initializer '{name}' must be dataType={expected_dtype}, got {data_type}")
+            assert expected_dtype is not None, "expected_dtype must be specified"
+            # Ensure expected_dtype can be a single type or a tuple of types
+            if not isinstance(expected_dtype, (tuple, list)):
+                expected_dtype = (expected_dtype,)
+            if data_type not in expected_dtype:
+                raise AssertionError(f"Initializer '{name}' must be dataType={expected_dtype}, got {data_type}")
+
             # External data
             if "externalData" in init:
                 offset = None
@@ -740,6 +759,19 @@ def convert(
                     break
             return None
 
+        def get_tensor_values(name, expected_dtype, expected_len=None):
+            """
+            Returns the values for the given name.
+            If the name is an initializer, calls get_initializer_values.
+            Otherwise, calls get_constant_values and asserts result is not None.
+            """
+            if any(init['name'] == name for init in initializers):
+                return get_initializer_values(name, expected_dtype, expected_len)
+            else:
+                values = get_constant_values(name, expected_dtype, expected_len)
+                assert values is not None, f"{name} is neither an initializer nor a constant"
+                return values
+
         # Handler for Clip -> WebNN clamp
         def handle_clip(node):
             inputs = node.get("input", [])
@@ -755,23 +787,13 @@ def convert(
 
             if len(inputs) > 1 and inputs[1]:
                 min_name = inputs[1]
-                if min_name in {init['name'] for init in initializers}:
-                    min_py = get_initializer_array(min_name, expected_dtype=1, expected_len=1)
-                    min_value = float(min_py[0])
-                else:
-                    min_py = get_constant_values(min_name, expected_dtype=1, expected_len=1)
-                    assert min_py is not None, f"Clip min input '{min_name}' must be an initializer or Constant node"
-                    min_value = float(min_py[0])
+                min_py = get_tensor_values(min_name, expected_dtype=1, expected_len=1)
+                min_value = float(min_py[0])
 
             if len(inputs) > 2 and inputs[2]:
                 max_name = inputs[2]
-                if max_name in {init['name'] for init in initializers}:
-                    max_py = get_initializer_array(max_name, expected_dtype=1, expected_len=1)
-                    max_value = float(max_py[0])
-                else:
-                    max_py = get_constant_values(max_name, expected_dtype=1, expected_len=1)
-                    assert max_py is not None, f"Clip max input '{max_name}' must be an initializer or Constant node"
-                    max_value = float(max_py[0])
+                max_py = get_tensor_values(max_name, expected_dtype=1, expected_len=1)
+                max_value = float(max_py[0])
 
             js = f"""const {output_var} = builder.clamp(
         {input_vars[0]},
@@ -883,8 +905,8 @@ def convert(
             shape_name = inputs[1]
             assert shape_name in {init['name'] for init in initializers}, f"Reshape shape input '{shape_name}' must be an initializer"
 
-            # Use get_initializer_array to get shape array as Python list
-            shape_py = get_initializer_array(shape_name, expected_dtype=7)
+            # Use get_tensor_values to get shape array as Python list
+            shape_py = get_tensor_values(shape_name, expected_dtype=7)
             # Replace all 0 values in shape_py with 1
             shape_py = [1 if int(x) == 0 else int(x) for x in shape_py]
             # Convert shape array to JS array string
@@ -946,11 +968,11 @@ def convert(
             sizes_js = "undefined"
             if len(inputs) > 3 and inputs[3]:
                 sizes_name = inputs[3]
-                sizes_py = get_initializer_array(sizes_name, expected_dtype=7, expected_len=4)
+                sizes_py = get_tensor_values(sizes_name, expected_dtype=7, expected_len=4)
                 sizes_js = f"[{int(sizes_py[2])}, {int(sizes_py[3])}]"
             if len(inputs) > 2 and inputs[2]:
                 scales_name = inputs[2]
-                scales_py = get_initializer_array(scales_name, expected_dtype=1, expected_len=4)
+                scales_py = get_tensor_values(scales_name, expected_dtype=1, expected_len=4)
                 scales_js = f"[{float(scales_py[2])}, {float(scales_py[3])}]"
 
             options = [
@@ -975,7 +997,9 @@ def convert(
             outputs = node.get("output", [])
             attrs = node.get("attribute", [])
             attr_dict = {a["name"]: a for a in attrs}
-            input_vars = [to_js_var_name(i) for i in inputs]
+            a_var_name = to_js_var_name(inputs[0])
+            # b might be a constant
+            b_var_name = try_create_constant(inputs[1])
             output_var = to_js_var_name(outputs[0])
 
             # Default values for alpha, beta, transA, transB
@@ -992,12 +1016,13 @@ def convert(
                 f"aTranspose: {str(bool(transA)).lower()}",
                 f"bTranspose: {str(bool(transB)).lower()}"
             ]
-            if len(input_vars) > 2:
-                options.append(f"C: {input_vars[2]}")
+            if len(inputs) > 2:
+                c_var_name = try_create_constant(inputs[2])
+                options.append(f"C: {c_var_name}")
 
             js = f"""const {output_var} = builder.gemm(
-        {input_vars[0]},
-        {input_vars[1]},
+        {a_var_name},
+        {b_var_name},
         {{
             {', '.join(options)}
         }}
@@ -1092,9 +1117,11 @@ def convert(
             def handler(node):
                 inputs = node.get("input", [])
                 outputs = node.get("output", [])
-                input_vars = [to_js_var_name(i) for i in inputs]
+                a_var_name = to_js_var_name(inputs[0])
+                # b might be a constant
+                b_var_name = try_create_constant(inputs[1])
                 output_var = to_js_var_name(outputs[0])
-                js = f"""const {output_var} = builder.{op}({input_vars[0]}, {input_vars[1]});"""
+                js = f"""const {output_var} = builder.{op}({a_var_name}, {b_var_name});"""
                 return js
             return handler
 
@@ -1149,42 +1176,32 @@ def convert(
 
                 # WebNN: builder.dequantizeLinear(x, scale, zeroPoint)
                 # ONNX: input, scale, zero_point (optional)
+                input_name = inputs[0]
+                input_var = try_create_constant(input_name)
+
                 input_shape = get_tensor_shape(inputs[0])
                 scale_shape = get_tensor_shape(inputs[1])
                 zero_point_shape = None
-                input_vars_zp = None
+                zero_point_var = None
                 if len(inputs) > 2:
                     zero_point_shape = get_tensor_shape(inputs[2])
-                    input_vars_zp = input_vars[2]
+                    zero_point_var = input_vars[2]
                 
                 # print(f"dequantizeLinear {outputs[0]} inputs {inputs[0]}: {input_shape}, {inputs[1]}: {scale_shape}, {inputs[2]}: {zero_point_shape}")
 
                 # WebNN requires scale and zeroPoint have the same rank as input
                 # If scale rank != input rank, expand scale shape for WebNN
+                scale_name = inputs[1]
+                scale_var = None
                 if len(scale_shape) != len(input_shape):
                     # Assert scale is an initializer
-                    scale_name = inputs[1]
                     assert any(init['name'] == scale_name for init in initializers), f"DequantizeLinear scale '{scale_name}' must be an initializer"
                     assert scale_shape == [] or len(scale_shape) == 1, f"DequantizeLinear scale shape must be scalar or 1D if not matching input rank, got {scale_shape}"
                     # Create new shape: all 1s, except axis
                     new_shape = [1] * len(input_shape)
                     if scale_shape and new_shape:  # not scalar
                         new_shape[axis] = scale_shape[0]
-                    # Recreate constant for scale with new shape if not already created
-                    # Encode shape into js var name
-                    shape_str = "_".join(str(x) for x in new_shape)
-                    scale_js_var = f"{to_js_var_name(scale_name)}_reshaped_{shape_str}"
-                    if scale_js_var not in js_var_set:
-                        scale_init = next(init for init in initializers if init['name'] == scale_name)
-                        scale_data = get_initializer_array(scale_name)
-                        scale_dtype = webnn_type_map.get(scale_init.get("dataType", 1), 'float32')
-                        scale_typed_array = typed_array_map.get(scale_init.get("dataType", 1), 'Float32Array')
-                        js_lines.append(f"""    const {scale_js_var} = builder.constant(
-        {{dataType: '{scale_dtype}', shape: [{', '.join(str(x) for x in new_shape)}]}},
-        new {scale_typed_array}([{', '.join(str(x) for x in scale_data)}])
-    );""")
-                        js_var_set.add(scale_js_var)
-                    input_vars[1] = scale_js_var
+                    scale_var = try_create_constant(scale_name, None, new_shape)
 
                     # Reset the scale_shape, it could be used to create zero point if it
                     # is not present
@@ -1193,19 +1210,12 @@ def convert(
                     # Do the same for zero point if it is present
                     if len(inputs) == 3:
                         zero_point_name = inputs[2]
-                        zero_point_js_var = f"{to_js_var_name(zero_point_name)}_reshaped_{shape_str}"
-                        if zero_point_js_var not in js_var_set:
-                            assert any(init['name'] == zero_point_name for init in initializers), f"DequantizeLinear zero_point '{zero_point_name}' must be an initializer"
-                            zero_point_init = next(init for init in initializers if init['name'] == zero_point_name)
-                            zero_point_data = get_initializer_array(zero_point_name)
-                            zero_point_dtype = webnn_type_map.get(zero_point_init.get("dataType", 1), 'float32')
-                            zero_point_typed_array = typed_array_map.get(zero_point_init.get("dataType", 1), 'Float32Array')
-                            js_lines.append(f"""    const {zero_point_js_var} = builder.constant(
-        {{dataType: '{zero_point_dtype}', shape: [{', '.join(str(x) for x in new_shape)}]}},
-        new {zero_point_typed_array}([{', '.join(str(x) for x in zero_point_data)}])
-    );""")
-                            js_var_set.add(zero_point_js_var)
-                        input_vars_zp = zero_point_js_var
+                        zero_point_var = try_create_constant(zero_point_name, None, new_shape)
+                else:
+                    scale_var = try_create_constant(scale_name)
+                    if len(inputs) == 3:
+                        zero_point_name = inputs[2]
+                        zero_point_var = try_create_constant(zero_point_name)
 
                 # Create a WebNN constant with value 0 and in shape of scale if zeroPoint is not present
                 if len(inputs) == 2:
@@ -1225,14 +1235,14 @@ def convert(
         {{dataType: '{zero_point_dtype}', shape: [{', '.join(str(x) for x in zero_point_shape)}]}},
         new {zero_point_typed_array}([{', '.join(str(x) for x in zero_point_data)}])
     );""")
-                    input_vars_zp = zero_point_js_var
+                    zero_point_var = zero_point_js_var
 
-                assert input_vars_zp is not None
+                assert zero_point_var is not None
 
                 js = f"""const {output_var} = builder.{op}(
-        {input_vars[0]},
-        {input_vars[1]},
-        {input_vars_zp}
+        {input_var},
+        {scale_var},
+        {zero_point_var}
     );"""
                 return js
             return handler
@@ -1287,16 +1297,16 @@ def convert(
                 # pads is provided as constant
                 if len(inputs) > 1 and inputs[1]:
                     pads_name = inputs[1]
-                    pads = get_initializer_array(pads_name, expected_dtype=7)
+                    pads = get_tensor_values(pads_name, expected_dtype=7)
                 # constant_value is provided as consant
                 if len(inputs) > 2 and inputs[2]:
                     value_name = inputs[2]
-                    value_py = get_initializer_array(value_name, expected_dtype=1, expected_len=1)
+                    value_py = get_tensor_values(value_name, expected_dtype=1, expected_len=1)
                     value = float(value_py[0])
                 # axes is provided as constant
                 if len(inputs) > 3 and inputs[3]:
                     axes_name = inputs[3]
-                    axes_py = get_initializer_array(axes_name, expected_dtype=[6, 7])
+                    axes_py = get_tensor_values(axes_name, expected_dtype=[6, 7])
                     # Handle negative axis
                     axes_py = [handle_negative_axis(int(axis), input_rank) for axis in axes_py]
 
