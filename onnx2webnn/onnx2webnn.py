@@ -44,7 +44,8 @@ def convert(
     nhwc: Optional[bool] = False,
     dump_json: Optional[bool] = False,
     json_indent: Optional[int] = 2,
-    imagenet: Optional[bool] = False
+    imagenet: Optional[bool] = False,
+    segmentation: Optional[bool] = False
 ):
     """
     Parameters
@@ -76,7 +77,11 @@ def convert(
         Default: 2
 
     imagenet: Optional[bool]
-        Generate code in index.html for testing imagenet\n\
+        Generate code in index.html for testing image classification model\n\
+        Default: false
+
+    segmentation: Optional[bool]
+        Generate code in index.html for testing segmentation model\n\
         Default: false
 
     Returns
@@ -95,6 +100,13 @@ def convert(
 
     if not onnx_graph:
         onnx_graph = onnx.load(input_onnx_file_path)
+
+    if imagenet and segmentation:
+        print(
+            f'{Color.RED}ERROR:{Color.RESET} '+
+            f'imagenet and segmentation cannot be specified at the same time.'
+        )
+        sys.exit(1)
 
     if not output_js_path:
         print(
@@ -1453,6 +1465,44 @@ def convert(
     );"""
             return js
 
+        def make_reduce_handler(op):
+            def handler(node):
+                inputs = node.get("input", [])
+                outputs = node.get("output", [])
+                attrs = node.get("attribute", [])
+                input_var = to_js_var_name(inputs[0])
+                output_var = to_js_var_name(outputs[0])
+                attr_dict = {a["name"]: a for a in attrs}
+                axes = attr_dict.get("axes", {}).get("ints", None)
+                axes = [int(a) for a in axes]
+                input_shape = get_tensor_shape(inputs[0])
+                if input_shape is None:
+                    raise AssertionError(f"Cannot get shape of input tensor '{inputs[0]}'.")
+                input_rank = len(input_shape)
+                # Handle negative axes
+                if axes is not None and isinstance(axes, list):
+                    axes = [handle_negative_axis(a, input_rank) for a in axes]
+
+                if nhwc and axes is not None and isinstance(axes, list) and input_rank == 4:
+                    axis_map = {0: 0, 1: 3, 2: 1, 3: 2}
+                    axes = [axis_map.get(a, a) for a in axes]
+
+                axes_js = None
+                if axes is not None:
+                    axes_js = f"[{', '.join(str(s) for s in axes)}]"
+                else:
+                    axes_js = "undefined"
+                keepdims = attr_dict.get("keepdims").get("i", 1)
+
+                opts = []
+                if axes is not None:
+                    opts.append(f"axes: {axes_js}")
+                opts.append(f"keepDimensions: {'true' if keepdims else 'false'}")
+                opts_str = ", ".join(opts)
+
+                return f"const {output_var} = builder.{op}({input_var}, {{ {opts_str} }});"
+            return handler
+
         # Register handlers
         op_handlers["Add"] = make_binary_handler("add")
         op_handlers["AveragePool"] = make_pool_handler("averagePool2d")
@@ -1474,6 +1524,7 @@ def convert(
         op_handlers["Mul"] = make_binary_handler("mul")
         op_handlers["QuantizeLinear"] = make_qdq_handler("quantizeLinear")
         op_handlers["Pad"] = handle_pad
+        op_handlers["ReduceMean"] = make_reduce_handler("reduceMean")
         op_handlers["Relu"] = make_unary_handler("relu")
         op_handlers["Reshape"] = handle_reshape
         op_handlers["Resize"] = handle_resize
@@ -1586,6 +1637,15 @@ def convert(
             else:
                 print(f"Warning: labels1000.txt not found in {onnx_dir}")
 
+        mean = None
+        std = None
+        if imagenet:
+            mean = [0.485, 0.456, 0.406]
+            std = [0.229, 0.224, 0.225]
+        if segmentation:
+            mean = [0, 0, 0]
+            std = [1, 1, 1]
+
         # Generate index.html to test the model
         html_path = os.path.join(os.path.dirname(output_js_path), "index.html")
         html_code = f"""<!DOCTYPE html>
@@ -1597,6 +1657,14 @@ def convert(
 <body>
     <h1>Test {output_js_path}</h1>
     {('<div id="imgblock"><input type="file" id="imgfile" accept="image/*"><canvas id="imgcanvas" style="display:none"></canvas></div>') if imagenet else ""}
+    {(
+        "<div id='imgblock'>"
+        "<input type='file' id='imgfile' accept='image/*'>"
+        "<canvas id='imgcanvas' style='display:none'></canvas>"
+        "<canvas id='maskcanvas' style='display:none'></canvas>"
+        "<canvas id='maskedcanvas' style='display:none'></canvas>"
+        "</div>"
+    ) if segmentation else ""}
     <button id="run-btn">Build & Run Model</button>
     <label for="deviceType">Device:</label>
     <select id="deviceType">
@@ -1642,8 +1710,8 @@ def convert(
          "                canvas.style.display = '';\n"
          "                const imgData = ctx.getImageData(0, 0, w, h).data;\n"
          "                let arr = new Float32Array(n * c * h * w);\n"
-         "                const mean = [0.485, 0.456, 0.406];\n"
-         "                const std = [0.229, 0.224, 0.225];\n"
+         f"                const mean = [{', '.join(str(x) for x in mean)}];\n"
+         f"                const std = [{', '.join(str(x) for x in std)}];\n"
          "                if (nhwc) {\n"
          "                    for (let y = 0; y < h; ++y) {\n"
          "                        for (let x = 0; x < w; ++x) {\n"
@@ -1674,13 +1742,13 @@ def convert(
          "        reader.readAsDataURL(file);\n"
          "    });\n"
          "}\n"
-         if imagenet else ""}
+         if imagenet or segmentation else ""}
 
         async function getInputs(model) {{
             const inputs = {{}};
             for (const name in model.inputTensors_) {{
                 const tensor = model.inputTensors_[name];
-                if ({'true' if imagenet else 'false'}) {{
+                if ({'true' if imagenet or segmentation else 'false'}) {{
                     // Use image input
                     inputs[name] = await getImageInputData(tensor.shape);
                 }} else {{
@@ -1743,6 +1811,60 @@ def convert(
             document.getElementById('output').textContent += msg;
         }}
 
+        // Draw segmentation mask on canvas
+        function showMask(results, outputTensors) {{
+            // Get the first output tensor's shape
+            const outputName = Object.keys(results)[0];
+            const mask = results[outputName]; // Float32Array
+            const tensorInfo = outputTensors[outputName];
+            let n = 1, c = 1, h = 0, w = 0;
+            if (tensorInfo && tensorInfo.shape && tensorInfo.shape.length === 4) {{
+                if ({'true' if nhwc else 'false'}) {{
+                    [n, h, w, c] = tensorInfo.shape;
+                }} else {{
+                    [n, c, h, w] = tensorInfo.shape;
+                }}
+            }}
+            const imageCanvas = document.getElementById('imgcanvas');
+            const imageCtx = imageCanvas.getContext('2d');
+            const imageData = imageCtx.getImageData(0, 0, w, h);
+
+            const maskCanvas = document.getElementById('maskcanvas');
+            maskCanvas.width = w;
+            maskCanvas.height = h;
+            maskCanvas.style.display = '';
+            const maskCtx = maskCanvas.getContext('2d');
+            const maskData = maskCtx.createImageData(w, h);
+
+            const maskedcanvas = document.getElementById('maskedcanvas');
+            maskedcanvas.width = w;
+            maskedcanvas.height = h;
+            maskedcanvas.style.display = '';
+            const maskedCtx = maskedcanvas.getContext('2d');
+            const maskedData = maskedCtx.getImageData(0, 0, w, h);
+
+            for (let y = 0; y < h; ++y) {{
+                for (let x = 0; x < w; ++x) {{
+                    let idx = {'true' if nhwc else 'false'}
+                        ? y * w * c + x * c + 0
+                        : 0 * h * w + y * w + x;
+                    let cond = mask[idx] > 0.2;
+                    let idx4 = (y * w + x) * 4;
+                    maskData.data[idx4 + 0] = cond ? 255 : 0;
+                    maskData.data[idx4 + 1] = cond ? 255 : 0;
+                    maskData.data[idx4 + 2] = cond ? 255 : 0;
+                    maskData.data[idx4 + 3] = 255;
+
+                    maskedData.data[idx4 + 0] = cond ? imageData.data[idx4 + 0] : 0;
+                    maskedData.data[idx4 + 1] = cond ? imageData.data[idx4 + 1] : 255;
+                    maskedData.data[idx4 + 2] = cond ? imageData.data[idx4 + 2] : 0;
+                    maskedData.data[idx4 + 3] = 255;
+                }}
+            }}
+            maskCtx.putImageData(maskData, 0, 0);
+            maskedCtx.putImageData(maskedData, 0, 0);
+        }}
+
         async function runModel() {{
             const output = document.getElementById('output');
             output.textContent = 'Building model...\\n';
@@ -1755,7 +1877,6 @@ def convert(
                 output.textContent += `Model built successfully. Build latency: ${{(t1 - t0).toFixed(2)}} ms\\n`;
 
                 // Output input tensor info
-                {"if (!" + str(imagenet).lower() + ") {" if imagenet else ""}
                 output.textContent += '\\nInput tensors:\\n';
                 for (const name in model.inputTensors_) {{
                     const tensor = model.inputTensors_[name];
@@ -1770,7 +1891,6 @@ def convert(
                     output.textContent += `  ${{name}}: shape=[${{tensor.shape}}], dataType=${{tensor.dataType}}\\n`;
                 }}
                 output.textContent += '\\n';
-                {"}" if imagenet else ""}
 
                 // Prepare input data
                 const inputs = await getInputs(model);
@@ -1790,7 +1910,9 @@ def convert(
                 const median = latencies[Math.floor(latencies.length / 2)];
                 output.textContent += `Median inference latency (${{numRuns}} runs): ${{median.toFixed(2)}} ms\\n`;
                 output.textContent += '\\n';
-                {"await showTop5(results);" if imagenet else "output.textContent += 'Inference results:\\n' + JSON.stringify(results, null, 2) + '\\n';"}
+                {"await showTop5(results);" if imagenet else ""}
+                {"await showMask(results, model.outputTensors_);" if segmentation else ""}
+                {"output.textContent += 'Inference results:\\n' + JSON.stringify(results, null, 2) + '\\n';" if not imagenet and not segmentation else ""}
 
             }} catch (e) {{
                 output.textContent += 'Error: ' + e;
@@ -1851,6 +1973,12 @@ def main():
         action='store_true',
         help='Test imagenet model in the generated index.html'
     )
+    parser.add_argument(
+        '-segmentation',
+        '--segmentation',
+        action='store_true',
+        help='Test segmentation model in the generated index.html'
+    )
 
     args = parser.parse_args()
 
@@ -1860,15 +1988,17 @@ def main():
     dump_json = args.dump_json
     json_indent = args.json_indent
     imagenet = args.imagenet
+    segmentation = args.segmentation
 
-    onnx_json = convert(
+    webnn_js = convert(
         input_onnx_file_path=input_onnx_file_path,
         onnx_graph=None,
         output_js_path=output_js_path,
         nhwc=nhwc,
         dump_json=dump_json,
         json_indent=json_indent,
-        imagenet=imagenet
+        imagenet=imagenet,
+        segmentation=segmentation
     )
 
 
