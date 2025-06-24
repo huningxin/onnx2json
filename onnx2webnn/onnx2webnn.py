@@ -237,6 +237,14 @@ def convert(
             else:
                 return []
 
+        def transpose_dims(dims, perm):
+            """
+            Transpose dims from NCHW to NHWC using permutation [0, 2, 3, 1].
+            """
+            if len(dims) == 4:
+                return [dims[i] for i in perm]
+            return dims
+
         initializers = onnx_json['graph'].get('initializer', [])
 
         # Generate all the graph input operands and tensors
@@ -249,20 +257,14 @@ def convert(
             if name in initializer_names:
                 continue
             dims = input_info.get('type', {}).get('tensorType', {}).get('shape', {}).get('dim', [])
-            dims_str = ', '.join(str(d.get('dimValue', 1)) for d in dims)
             elem_type = input_info.get('type', {}).get('tensorType', {}).get('elemType', 1)
             webnn_dtype = webnn_type_map.get(elem_type, 'float32')
             js_var_name = to_js_var_name(name)
             if nhwc and len(dims) == 4:
-                js_lines.append("    // Transpose input from NCHW -> NHWC.")
-                # Transpose input from NCHW -> NHWC
-                # Compose builder.input and builder.transpose in one line, keeping js_var_name unchanged
-                js_code = f"""const {js_var_name} = builder.transpose(
-        builder.input('{name}', {{dataType: '{webnn_dtype}', shape: [{dims_str}]}}),
-        {{ permutation: [0, 2, 3, 1] }}
-    );"""
-            else:
-                js_code = f"""const {js_var_name} = builder.input(
+                js_lines.append(f"""    // Input '{js_var_name}' layout is NHWC.""")
+                dims = transpose_dims(dims, [0, 2, 3, 1])
+            dims_str = ', '.join(str(d.get('dimValue', 1)) for d in dims)
+            js_code = f"""const {js_var_name} = builder.input(
         '{name}',
         {{dataType: '{webnn_dtype}', shape: [{dims_str}]}}
     );"""
@@ -1505,13 +1507,7 @@ def convert(
             for i, (output_var, output_info) in enumerate(zip(output_vars, graph_outputs)):
                 dims = output_info.get('type', {}).get('tensorType', {}).get('shape', {}).get('dim', [])
                 if len(dims) == 4:
-                    js_lines.append("    // Transpose output from NHWC TO NCHW.")
-                    trans_var = output_var + "_nchw"
-                    js_lines.append(f"""    const {trans_var} = builder.transpose(
-        {output_var},
-        {{ permutation: [0, 3, 1, 2] }}
-    );""")
-                    output_vars[i] = trans_var
+                    js_lines.append(f"""    // Output '{output_var}' layout is NHWC.""")
 
         if output_vars:
             if len(output_vars) == 1:
@@ -1615,8 +1611,8 @@ def convert(
     <script type="module">
         import {{ {class_name} }} from './{os.path.basename(output_js_path)}';
 
-        {"// Convert image file to Float32Array in NCHW and display image\n"
-         "async function getImageInputData(inputShape) {\n"
+        {"// Convert image file to Float32Array in NCHW or NHWC and display image\n"
+         f"async function getImageInputData(inputShape, nhwc = {'true' if nhwc else 'false'}) {{\n"
          "    return new Promise((resolve, reject) => {\n"
          "        const fileInput = document.getElementById('imgfile');\n"
          "        if (!fileInput.files.length) {\n"
@@ -1628,7 +1624,16 @@ def convert(
          "        reader.onload = function(e) {\n"
          "            const img = new Image();\n"
          "            img.onload = function() {\n"
-         "                const [n, c, h, w] = inputShape.length === 4 ? inputShape : [1, 3, 224, 224];\n"
+         "                let n, c, h, w;\n"
+         "                if (inputShape.length === 4) {\n"
+         "                    if (nhwc) {\n"
+         "                        [n, h, w, c] = inputShape;\n"
+         "                    } else {\n"
+         "                        [n, c, h, w] = inputShape;\n"
+         "                    }\n"
+         "                } else {\n"
+         "                    [n, c, h, w] = [1, 3, 224, 224];\n"
+         "                }\n"
          "                const canvas = document.getElementById('imgcanvas');\n"
          "                canvas.width = w;\n"
          "                canvas.height = h;\n"
@@ -1639,12 +1644,24 @@ def convert(
          "                let arr = new Float32Array(n * c * h * w);\n"
          "                const mean = [0.485, 0.456, 0.406];\n"
          "                const std = [0.229, 0.224, 0.225];\n"
-         "                for (let ch = 0; ch < c; ++ch) {\n"
+         "                if (nhwc) {\n"
          "                    for (let y = 0; y < h; ++y) {\n"
          "                        for (let x = 0; x < w; ++x) {\n"
-         "                            let v = imgData[(y * w + x) * 4 + ch] / 255.0;\n"
-         "                            v = (v - mean[ch]) / std[ch];\n"
-         "                            arr[ch * h * w + y * w + x] = v;\n"
+         "                            for (let ch = 0; ch < c; ++ch) {\n"
+         "                                let v = imgData[(y * w + x) * 4 + ch] / 255.0;\n"
+         "                                v = (v - mean[ch]) / std[ch];\n"
+         "                                arr[y * w * c + x * c + ch] = v;\n"
+         "                            }\n"
+         "                        }\n"
+         "                    }\n"
+         "                } else {\n"
+         "                    for (let ch = 0; ch < c; ++ch) {\n"
+         "                        for (let y = 0; y < h; ++y) {\n"
+         "                            for (let x = 0; x < w; ++x) {\n"
+         "                                let v = imgData[(y * w + x) * 4 + ch] / 255.0;\n"
+         "                                v = (v - mean[ch]) / std[ch];\n"
+         "                                arr[ch * h * w + y * w + x] = v;\n"
+         "                            }\n"
          "                        }\n"
          "                    }\n"
          "                }\n"
