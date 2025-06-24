@@ -10,7 +10,8 @@ $ pip install -U onnx protobuf numpy
 ```
 ## CLI Usage
 ```
-usage: onnx2webnn.py [-h] -if INPUT_ONNX_FILE_PATH -oj OUTPUT_JS_PATH [-nhwc] [-json] [-i JSON_INDENT] [-imagenet]
+usage: onnx2webnn.py [-h] -if INPUT_ONNX_FILE_PATH -oj OUTPUT_JS_PATH [-nhwc] [-json]
+                     [-i JSON_INDENT] [-imagenet] [-segmentation]
 
 options:
   -h, --help            show this help message and exit
@@ -24,6 +25,8 @@ options:
                         Number of indentations in JSON. (default=2)
   -imagenet, --imagenet
                         Test imagenet model in the generated index.html
+  -segmentation, --segmentation
+                        Test segmentation model in the generated index.html
 ```
 
 ## Generate WebNN JavaScript model
@@ -112,6 +115,22 @@ $ python onnx2webnn.py -if ../sample_models/mobilenetv2-12-static.onnx -oj mobil
 ```
 
 It will generate image pre-processing and result post-processing code in index.html. After launching index.html, you can upload an image as input. After running the model, the top 5 classification results will be displayed.
+
+## Test image segmentation models
+For image segmetnation models, such as MediaPipe selfie segmentation model, you can specify `--segmentation` switch to generate the testing code in index.html. This is useful to verify the correctness of generated WebNN models.
+
+For example, download MediaPipe selfie segmentation ONNX model from https://huggingface.co/onnx-community/mediapipe_selfie_segmentation/blob/main/onnx/model.onnx, rename it to mediapipe-selfie-segmentation.onnx.
+
+Use onnx2sim to override the free dimension and do the shape inference:
+```shell
+$ onnxsim mediapipe-selfie-segmentation.onnx mediapipe-selfie-segmentation-simplified.onnx --overwrite-input-shape 1,3,256,256
+```
+
+Generate the WebNN model with test code
+```shell
+$ python onnx2webnn.py -if ..\sample_models\mediapipe-selfie-segmentation-simplified.onnx -oj selfie_segmentation_nhwc\selfie_segmentation_nhwc.js -nhwc -segmentation
+```
+It will generate image pre-processing and result post-processing code in index.html. After launching index.html, you can upload an image as input. After running the model, the original image, mask and masked image will be displayed.
 
 ## Dump JSON
 You can also dump the JSON file for debugging purpose.
